@@ -1,0 +1,10 @@
+{
+  "name": "colyseus-rs-client",
+  "version": "0.1.0",
+  "description": "Minimal TypeScript client for colyseus-rs servers",
+  "type": "module",
+  "main": "src/client.ts",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0"
+  }
+}

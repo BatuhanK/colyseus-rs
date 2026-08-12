@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / web
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Databases (local dev)
+*.sqlite
+*.sqlite-journal
+
+# Env files (keep .env.example tracked)
+.env
+.env.local
+.env.*.local
+
+# Logs / OS junk
+*.log
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+demos/mapguesser

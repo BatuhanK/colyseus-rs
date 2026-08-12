@@ -1,0 +1,14 @@
+[package]
+name = "tictactoe-server"
+version = "0.1.0"
+edition = "2021"
+description = "Tic-tac-toe + chat game backend built on colyseus-rs"
+
+[dependencies]
+colyseus = { path = "../../../crates/colyseus" }
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
