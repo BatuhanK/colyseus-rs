@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/colyseus", "demos/tictactoe/server", "demos/trivia/server", "demos/mapguesser/server"]
+members = ["crates/colyseus", "demos/tictactoe/server", "demos/trivia/server"]
 
 [profile.release]
 lto = true
