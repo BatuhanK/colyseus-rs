@@ -20,7 +20,7 @@ mod state;
 use std::sync::Arc;
 
 use colyseus::serde_json::json;
-use colyseus::{MatchmakerEvent, Server};
+use colyseus::{FileSnapshotStore, MatchmakerEvent, PersistenceConfig, Server};
 use llm::LlmClient;
 use results::ResultsPublisher;
 use room::TriviaRoom;
@@ -46,7 +46,8 @@ async fn main() {
         .public_address("localhost:2568")
         .admin_panel(Some(
             std::env::var("ADMIN_TOKEN").unwrap_or_else(|_| "admin123".into()),
-        ));
+        ))
+        .persistence(PersistenceConfig::new(FileSnapshotStore::new("./snapshots")));
 
     server
         .define("trivia", {
@@ -57,16 +58,21 @@ async fn main() {
         .filter_by(&["difficulty", "category"])
         .sort_by(&[("clients", 1)]);
 
-    // the global chat room — internal: only creatable server-side
+    // the global chat room — internal: only creatable server-side, and
+    // non-persistent: recreated fresh at every startup (never snapshotted)
     let chat_handle = ChatHandle::default();
     server.define("chat", {
         let chat_handle = chat_handle.clone();
         move || ChatRoom::new(chat_handle.clone())
-    }).internal();
+    }).internal().persistent(false);
 
     // build the router manually (instead of server.listen) so we can create
     // the bootstrap room and subscribe to lobby events before serving
     let (app, mm) = server.build();
+
+    // restore persisted rooms before accepting traffic
+    let restored = mm.restore_all().await;
+    tracing::info!("restored {} room(s) from snapshots", restored.len());
 
     mm.create_room("chat", json!({}))
         .await

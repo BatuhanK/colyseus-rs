@@ -27,8 +27,9 @@ use crate::error::{codes, Result, ServerError};
 use crate::matchmaker::{AuthContext, MatchmakerEvent};
 use crate::presence::Presence;
 use crate::protocol::{self, MessageType};
-use crate::state::{StateSlot, JSON_PATCH_SERIALIZER_ID, NONE_SERIALIZER_ID};
-use crate::utils::Clock;
+use crate::snapshot::{PersistedReconnection, PersistedSeat, PersistenceHandle, RoomSnapshot};
+use crate::state::{InternalSlot, StateSlot, JSON_PATCH_SERIALIZER_ID, NONE_SERIALIZER_ID};
+use crate::utils::{instant_to_wallclock_ms, wallclock_ms_to_instant, Clock};
 
 /// Boxed, sendable future used by handlers, timers and commands.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -205,6 +206,30 @@ pub trait Room: RoomAny {
         Ok(())
     }
 
+    /// Called after [`Self::on_create`] when the room is restored from a
+    /// persisted snapshot. `on_create` runs first (re-registering message
+    /// handlers and setting defaults); override this to overlay the persisted
+    /// state via [`RoomContext::restore_state`] / [`RoomContext::restore_internal`]
+    /// and to rebuild non-serializable services or timers.
+    ///
+    /// The default is a no-op: the room resumes with `on_create` defaults
+    /// (persisted state is discarded) — override to actually resume.
+    async fn on_restore(&mut self, _ctx: &mut RoomContext, _snapshot: &RoomSnapshot) -> Result<()> {
+        Ok(())
+    }
+
+    /// Schema version of this room type. Bump it when the persisted state
+    /// shape changes and implement [`Self::on_migrate`]. Default `1`.
+    fn schema_version(&self) -> u32 {
+        1
+    }
+
+    /// Transform an older snapshot before restore. `from_version` is the
+    /// snapshot's schema version; `snapshot` may be mutated in place.
+    fn on_migrate(&mut self, _from_version: u32, _snapshot: &mut RoomSnapshot) -> Result<()> {
+        Ok(())
+    }
+
     /// Called when a client requests a seat (before the WebSocket connects).
     /// Return `Ok(Some(auth))` to accept, `Ok(None)` to accept without auth
     /// data, or `Err` to reject the client.
@@ -257,6 +282,8 @@ pub struct RoomContext {
 
     pub(crate) clients: Vec<Client>,
     pub(crate) state_slot: Option<StateSlot>,
+    /// Server-only serializable state. Never broadcast; survives restarts.
+    pub(crate) internal_slot: Option<InternalSlot>,
 
     /// Room clock; ticked by the framework.
     pub clock: Clock,
@@ -298,6 +325,13 @@ pub struct RoomContext {
     pub(crate) filter_extra: Map<String, Value>,
     pub(crate) sender: Option<RoomSender>,
     pub(crate) tap: EventTap,
+
+    /// Room type schema version (set after the create/restore hook).
+    pub(crate) schema_version: u32,
+    /// Original creation options (replayed into snapshots).
+    pub(crate) create_options: Value,
+    /// Snapshot persistence, when configured on the server.
+    pub(crate) persistence: Option<PersistenceHandle>,
 }
 
 impl RoomContext {
@@ -309,6 +343,7 @@ impl RoomContext {
         presence: Arc<dyn Presence>,
         lobby_tx: broadcast::Sender<MatchmakerEvent>,
         filter_extra: Map<String, Value>,
+        persistence: Option<PersistenceHandle>,
     ) -> Self {
         RoomContext {
             room_id,
@@ -317,6 +352,7 @@ impl RoomContext {
             created_at: now_millis(),
             clients: Vec::new(),
             state_slot: None,
+            internal_slot: None,
             clock: Clock::new(),
             auto_dispose: true,
             max_messages_per_second: None,
@@ -346,6 +382,9 @@ impl RoomContext {
             filter_extra,
             sender: None,
             tap: broadcast::channel(512).0,
+            schema_version: 1,
+            create_options: Value::Null,
+            persistence,
         }
     }
 
@@ -382,6 +421,11 @@ impl RoomContext {
 
     pub fn process_id(&self) -> &str {
         &self.process_id
+    }
+
+    /// Wall-clock ms epoch the room was (originally) created.
+    pub fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     pub fn clients(&self) -> &[Client] {
@@ -424,6 +468,228 @@ impl RoomContext {
             JSON_PATCH_SERIALIZER_ID
         } else {
             NONE_SERIALIZER_ID
+        }
+    }
+
+    /// Set the room's server-only serializable state. Never broadcast to
+    /// clients; persisted in snapshots so it survives restarts.
+    pub fn set_internal<I: Serialize + serde::de::DeserializeOwned + Send + 'static>(
+        &mut self,
+        state: I,
+    ) {
+        self.internal_slot = Some(InternalSlot::new(state));
+    }
+
+    pub fn internal<T: 'static>(&self) -> Option<&T> {
+        self.internal_slot.as_ref()?.get::<T>()
+    }
+
+    pub fn internal_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.internal_slot.as_mut()?.get_mut::<T>()
+    }
+
+    pub fn clear_internal(&mut self) {
+        self.internal_slot = None;
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence (snapshots)
+    // ------------------------------------------------------------------
+
+    /// Whether the server has snapshot persistence configured.
+    pub fn has_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Disable snapshot persistence for this room.
+    pub fn disable_persistence(&mut self) {
+        self.persistence = None;
+    }
+
+    /// Build the room's full serializable snapshot.
+    pub fn snapshot(&self) -> RoomSnapshot {
+        RoomSnapshot {
+            schema_version: self.schema_version,
+            room_id: self.room_id.clone(),
+            room_name: self.room_name.clone(),
+            process_id: self.process_id.clone(),
+            created_at: self.created_at,
+            saved_at: now_millis(),
+            clock_elapsed_ms: self.clock.elapsed_millis(),
+            options: self.create_options.clone(),
+            state: self
+                .state_slot
+                .as_ref()
+                .map(|s| s.full())
+                .unwrap_or(Value::Null),
+            internal: self
+                .internal_slot
+                .as_ref()
+                .map(|s| s.full())
+                .unwrap_or(Value::Null),
+            metadata: self.metadata.clone(),
+            locked: self.locked,
+            is_private: self.is_private,
+            max_clients: self.max_clients,
+            filter_extra: self.filter_extra.clone(),
+            reconnections: self.persisted_reconnections(),
+            seats: self.persisted_seats(),
+        }
+    }
+
+    fn persisted_reconnections(&self) -> Vec<PersistedReconnection> {
+        let mut out = Vec::new();
+
+        // Clients already reconnecting (seat held, waiting on their token).
+        for (token, e) in &self.reconnections {
+            out.push(PersistedReconnection {
+                session_id: e.session_id.clone(),
+                token: token.clone(),
+                expires_at_ms: e.expires_at.map(instant_to_wallclock_ms),
+                auth: e.client.auth(),
+                user_data: e.client.user_data(),
+            });
+        }
+
+        // Clients currently connected — persist their token too, so they can
+        // reconnect after a restart (their WebSocket is gone on restore).
+        // Without this, connected players would turn into "ghost" entries in
+        // the restored public state with no way back in.
+        for client in self.clients.iter().filter(|c| c.is_joined()) {
+            let token = client.reconnection_token();
+            if token.is_empty() || self.reconnections.contains_key(&token) {
+                continue;
+            }
+            out.push(PersistedReconnection {
+                session_id: client.session_id().to_string(),
+                token,
+                // manual: no reconnect deadline (graceful restart — they're
+                // expected back; the app can expire them in `on_restore`).
+                expires_at_ms: None,
+                auth: client.auth(),
+                user_data: client.user_data(),
+            });
+        }
+
+        out
+    }
+
+    fn persisted_seats(&self) -> Vec<PersistedSeat> {
+        self.reserved_seats
+            .iter()
+            .filter(|(_, s)| !s.waiting_reconnection && !s.consumed)
+            .map(|(sid, s)| PersistedSeat {
+                session_id: sid.clone(),
+                options: s.options.clone(),
+                auth: s.auth.clone(),
+                expires_at_ms: instant_to_wallclock_ms(s.expires_at),
+            })
+            .collect()
+    }
+
+    /// Write the current state to the snapshot store immediately (queued on
+    /// the background writer). Use this for explicit save points (e.g. after
+    /// a round ends).
+    pub fn persist_now(&self) {
+        if let Some(p) = &self.persistence {
+            let bytes = crate::snapshot::encode_snapshot(&self.snapshot());
+            p.writer.save(&self.room_id, bytes);
+            self.tap_log(RoomEventLog::new("sys", "snapshot_saved"));
+        }
+    }
+
+    pub(crate) fn delete_snapshot(&self) {
+        if let Some(p) = &self.persistence {
+            p.writer.delete(&self.room_id);
+        }
+    }
+
+    /// Deserialize and set the public state from a snapshot (restore helper).
+    pub fn restore_state<S: Serialize + serde::de::DeserializeOwned + Send + 'static>(
+        &mut self,
+        snapshot: &RoomSnapshot,
+    ) -> Result<()> {
+        let state = snapshot
+            .state::<S>()
+            .map_err(|e| ServerError::new(codes::INVALID_PAYLOAD, e))?;
+        self.set_state(state);
+        Ok(())
+    }
+
+    /// Deserialize and set the internal state from a snapshot (restore helper).
+    pub fn restore_internal<I: Serialize + serde::de::DeserializeOwned + Send + 'static>(
+        &mut self,
+        snapshot: &RoomSnapshot,
+    ) -> Result<()> {
+        let internal = snapshot
+            .internal::<I>()
+            .map_err(|e| ServerError::new(codes::INVALID_PAYLOAD, e))?;
+        self.set_internal(internal);
+        Ok(())
+    }
+
+    /// Apply the framework-managed snapshot fields (clock, metadata, lock,
+    /// seats, reconnections) to this context. Called during restore before
+    /// [`Room::on_restore`].
+    pub(crate) fn apply_snapshot(&mut self, snapshot: &RoomSnapshot) {
+        self.created_at = snapshot.created_at;
+        self.clock = Clock::restore(Duration::from_millis(snapshot.clock_elapsed_ms));
+        self.metadata = snapshot.metadata.clone();
+        self.locked = snapshot.locked;
+        self.is_private = snapshot.is_private;
+        self.max_clients = snapshot.max_clients;
+        self.filter_extra = snapshot.filter_extra.clone();
+        self.create_options = snapshot.options.clone();
+
+        self.reconnections.clear();
+        self.reserved_seats.clear();
+        self.clients.clear();
+
+        for r in &snapshot.reconnections {
+            let client = Client::orphan(&r.session_id);
+            if let Some(a) = &r.auth {
+                client.set_auth(Some(a.clone()));
+            }
+            if let Some(ud) = &r.user_data {
+                client.set_user_data(ud.clone());
+            }
+            client.set_reconnection_token(r.token.clone());
+            client.set_state(ClientState::Reconnecting);
+            let expires_at = r.expires_at_ms.map(wallclock_ms_to_instant);
+            self.reconnections.insert(
+                r.token.clone(),
+                ReconnectionEntry {
+                    session_id: r.session_id.clone(),
+                    client: client.clone(),
+                    expires_at,
+                },
+            );
+            self.reserved_seats.insert(
+                r.session_id.clone(),
+                ReservedSeat {
+                    options: Value::Null,
+                    auth: r.auth.clone(),
+                    consumed: false,
+                    waiting_reconnection: true,
+                    expires_at: expires_at.unwrap_or_else(|| {
+                        Instant::now() + Duration::from_secs(86400 * 365)
+                    }),
+                },
+            );
+            self.clients.push(client);
+        }
+
+        for s in &snapshot.seats {
+            self.reserved_seats.insert(
+                s.session_id.clone(),
+                ReservedSeat {
+                    options: s.options.clone(),
+                    auth: s.auth.clone(),
+                    consumed: false,
+                    waiting_reconnection: false,
+                    expires_at: wallclock_ms_to_instant(s.expires_at_ms),
+                },
+            );
         }
     }
 
@@ -943,6 +1209,7 @@ impl Default for RoomContext {
             crate::presence::LocalPresence::new(),
             broadcast::channel(16).0,
             Map::new(),
+            None,
         );
         ctx.set_sender(RoomSender::for_tests(tx));
         ctx

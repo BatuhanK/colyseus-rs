@@ -98,6 +98,18 @@ impl Client {
         }
     }
 
+    /// A client handle with no live transport.
+    ///
+    /// Used when restoring persisted reconnection entries: the handle carries
+    /// the session id / auth / user data so a reconnecting client can be
+    /// re-seated, but any outbound send is dropped silently (the receiver is
+    /// dropped immediately).
+    pub(crate) fn orphan(session_id: &str) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        Client::new(session_id.to_string(), tx)
+    }
+
     pub fn session_id(&self) -> &str {
         &self.inner.session_id
     }

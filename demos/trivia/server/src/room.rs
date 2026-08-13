@@ -1,39 +1,32 @@
 //! The trivia room: a thin `Room` impl that delegates all game logic to
 //! commands (see `commands/`). Server-only secrets live here, never in state.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use colyseus::serde_json::{json, Value};
 use colyseus::{
     async_trait, codes, AuthContext, Client, Dispatchable, Dispatcher, Result, Room, RoomContext,
-    ServerError,
+    RoomSnapshot, ServerError,
 };
 use serde::Deserialize;
 
 use crate::auth;
-use crate::commands;
-use crate::llm::{LlmClient, Question};
+use crate::commands::{self, Advance, EndRound, GenerateQuestions};
+use crate::llm::LlmClient;
 use crate::results::ResultsPublisher;
-use crate::state::{TriviaState, MAX_PLAYERS, MAX_SPECTATORS};
+use crate::state::{
+    now_millis, TriviaInternal, TriviaState, MAX_PLAYERS, MAX_SPECTATORS, REVEAL_BREAK, ROUND_TIME,
+};
 
 pub struct TriviaRoom {
     dispatcher: Dispatcher<TriviaRoom>,
 
-    // services
+    // services (rebuilt by the factory / `on_restore`)
     pub llm: Arc<LlmClient>,
     pub results: Option<Arc<ResultsPublisher>>,
 
-    // room settings
-    pub password: Option<String>,
-
-    // server-only game data (never synchronized to clients):
-    pub correct_index: Option<usize>,
-    pub round_answers: HashMap<String, usize>,
-    pub pending_questions: HashMap<u32, Question>,
-    pub batch_in_flight: bool,
-    pub needed_round: Option<u32>,
+    // transient (timer ids don't survive restarts; re-armed in `on_restore`)
     pub round_timer: Option<u64>,
     pub break_timer: Option<u64>,
 }
@@ -44,14 +37,63 @@ impl TriviaRoom {
             dispatcher: Dispatcher::new(),
             llm,
             results,
-            password: None,
-            correct_index: None,
-            round_answers: HashMap::new(),
-            pending_questions: HashMap::new(),
-            batch_in_flight: false,
-            needed_round: None,
             round_timer: None,
             break_timer: None,
+        }
+    }
+
+    pub(crate) fn internal(ctx: &RoomContext) -> &TriviaInternal {
+        ctx.internal::<TriviaInternal>().expect("internal state is set")
+    }
+
+    pub(crate) fn internal_mut(ctx: &mut RoomContext) -> &mut TriviaInternal {
+        ctx.internal_mut::<TriviaInternal>().expect("internal state is set")
+    }
+
+    /// Resume in-flight work after a restore: the background LLM task died with
+    /// the process, so clear its in-flight flag and either re-trigger question
+    /// generation ("generating") or re-arm the phase timer ("question" /
+    /// "reveal") from the persisted wall-clock deadline.
+    async fn resume_after_restore(&mut self, ctx: &mut RoomContext) {
+        // any background LLM task died with the process — clear the stale flag
+        TriviaRoom::internal_mut(ctx).batch_in_flight = false;
+
+        let (phase, ends_at) = {
+            let state = ctx.state::<TriviaState>().unwrap();
+            (state.phase.clone(), state.phase_ends_at)
+        };
+        let now = now_millis();
+        match phase.as_str() {
+            "generating" => {
+                // the batch was being produced when we died — restart it
+                if TriviaRoom::internal(ctx).needed_round.is_none() {
+                    TriviaRoom::internal_mut(ctx).needed_round = Some(1);
+                }
+                self.dispatch(ctx, GenerateQuestions).await;
+            }
+            "question" => {
+                let remaining = ends_at
+                    .map(|t| t.saturating_sub(now))
+                    .unwrap_or(ROUND_TIME.as_millis() as u64);
+                self.round_timer = Some(ctx.set_timeout(
+                    Duration::from_millis(remaining),
+                    |room: &mut TriviaRoom, ctx| {
+                        Box::pin(async move { room.dispatch(ctx, EndRound).await })
+                    },
+                ));
+            }
+            "reveal" => {
+                let remaining = ends_at
+                    .map(|t| t.saturating_sub(now))
+                    .unwrap_or(REVEAL_BREAK.as_millis() as u64);
+                self.break_timer = Some(ctx.set_timeout(
+                    Duration::from_millis(remaining),
+                    |room: &mut TriviaRoom, ctx| {
+                        Box::pin(async move { room.dispatch(ctx, Advance).await })
+                    },
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -172,22 +214,25 @@ impl Room for TriviaRoom {
             .to_string();
 
         ctx.set_state(TriviaState::new(difficulty, &category));
+        ctx.set_internal(TriviaInternal::default());
         ctx.set_max_clients(Some((MAX_PLAYERS + MAX_SPECTATORS) as u32));
         ctx.set_patch_rate(Some(Duration::from_millis(50)));
 
-        // optional room password — stored room-internally, never in state
-        self.password = options["password"]
+        // optional room password — stored in private internal state
+        let password = options["password"]
             .as_str()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty() && s.len() <= 64)
             .map(String::from);
-        ctx.state_mut::<TriviaState>().unwrap().has_password = self.password.is_some();
+        let has_password = password.is_some();
+        TriviaRoom::internal_mut(ctx).password = password;
+        ctx.state_mut::<TriviaState>().unwrap().has_password = has_password;
         ctx.set_metadata(json!({
             "phase": "lobby",
             "round": 0,
             "players": 0,
             "spectators": 0,
-            "hasPassword": self.password.is_some(),
+            "hasPassword": has_password,
         }));
 
         // every client message just becomes a command
@@ -243,14 +288,23 @@ impl Room for TriviaRoom {
         Ok(())
     }
 
+    async fn on_restore(&mut self, ctx: &mut RoomContext, snapshot: &RoomSnapshot) -> Result<()> {
+        ctx.restore_state::<TriviaState>(snapshot)?;
+        ctx.restore_internal::<TriviaInternal>(snapshot)?;
+        // services (llm/results) are already rebuilt by the factory; resume
+        // any in-flight generation or re-arm the phase timer.
+        self.resume_after_restore(ctx).await;
+        Ok(())
+    }
+
     async fn on_auth(
         &mut self,
-        _ctx: &mut RoomContext,
+        ctx: &mut RoomContext,
         options: &Value,
         auth_ctx: &AuthContext,
     ) -> Result<Option<Value>> {
         // room password gate (before identity verification is even relevant)
-        if let Some(expected) = &self.password {
+        if let Some(expected) = TriviaRoom::internal(ctx).password.clone() {
             match options["password"].as_str() {
                 None => {
                     return Err(ServerError::new(codes::AUTH_FAILED, "password required"));

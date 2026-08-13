@@ -102,6 +102,7 @@ cargo run --example game    # state sync, game loop, reconnection
 | Multi-process (Redis driver + IPC) | ✅ | 🔜 trait seams exist, not implemented |
 | Graceful shutdown | ✅ | ✅ (SIGINT/SIGTERM → dispose all rooms) |
 | Admin panel / monitor | `@colyseus/monitor` | ✅ built-in (`/admin`) |
+| Snapshot persistence (public + internal state, resume after restart) | 🔜 | ✅ |
 | `devMode` room restore | ✅ | 🔜 |
 
 ## Architecture
@@ -259,6 +260,67 @@ tokio::spawn(async move {
     }));
 });
 ```
+
+## Persistence (snapshots)
+
+Rooms can persist their full serializable footprint — the public state
+(client-visible), a server-only *internal* state, and framework fields
+(metadata, lock, seats, reconnections) — to a local snapshot store and resume
+seamlessly across restarts.
+
+```rust
+use colyseus::{FileSnapshotStore, PersistenceConfig};
+
+Server::new().persistence(
+    PersistenceConfig::new(FileSnapshotStore::new("./snapshots"))
+        .auto_save_interval(Duration::from_secs(1)) // debounce (default 1s)
+        .save_on_dispose(true)   // final write on dispose (default)
+        .delete_on_dispose(false), // keep the snapshot (default)
+);
+```
+
+Three tiers of room data:
+
+| Tier | Example | API |
+| --- | --- | --- |
+| Public state (synced) | board, scores, phase | `ctx.set_state` / `ctx.state_mut` |
+| Internal state (private, serialized) | correct answer, password, pending queue | `ctx.set_internal` / `ctx.internal_mut` |
+| Transient (rebuilt) | `Arc<LlmClient>`, timer ids, dispatcher | plain room fields |
+
+Implement `on_restore` to resume. `on_create` always runs first (re-register
+message handlers + defaults); then `on_restore` overlays the persisted state:
+
+```rust
+use colyseus::RoomSnapshot;
+
+async fn on_restore(&mut self, ctx: &mut RoomContext, snapshot: &RoomSnapshot) -> Result<()> {
+    ctx.restore_state::<GameState>(snapshot)?;
+    ctx.restore_internal::<GameInternal>(snapshot)?;
+    // rebuild services + re-arm timers from wall-clock deadlines
+    self.rearm_timers(ctx).await;
+    Ok(())
+}
+```
+
+Notes:
+
+- Snapshots are written atomically (temp file + fsync + rename) and checksummed;
+  corrupt files are quarantined and the room restarts fresh.
+- One snapshot file per room: `./snapshots/{roomId}.snap`.
+- On `Server::listen`, persisted rooms are restored **before** traffic is
+  accepted (`restore_all()` — also callable manually when serving via
+  `Server::build()`).
+- Timers (`set_timeout`) don't survive restarts. Persist wall-clock deadlines
+  in state/internal and re-arm the timers in `on_restore`.
+- Reconnection tokens and reserved seats are persisted too, so a client with
+  a live reconnection token can rejoin after a restart.
+- Bump `schema_version()` and implement `on_migrate(from, &mut snapshot)` when
+  the persisted state shape changes.
+
+See `demos/trivia` (internal state + re-armed timers) and `demos/tictactoe`
+(public state only) for working examples, and
+`tests/integration.rs::persistence_restores_state_and_internal_across_restart`
+for the end-to-end restart test.
 
 ## Admin panel (`@colyseus/monitor` counterpart)
 

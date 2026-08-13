@@ -24,7 +24,7 @@ pub struct Join {
 impl Command<TriviaRoom> for Join {
     fn execute<'a>(
         self: Box<Self>,
-        room: &'a mut TriviaRoom,
+        _room: &'a mut TriviaRoom,
         ctx: &'a mut RoomContext,
         d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
@@ -50,8 +50,11 @@ impl Command<TriviaRoom> for Join {
                 ctx.remove_client(&old_sid);
 
                 // transfer the round answer, if any was locked in
-                if let Some(answer) = room.round_answers.remove(&old_sid) {
-                    room.round_answers.insert(self.session_id.clone(), answer);
+                {
+                    let internal = TriviaRoom::internal_mut(ctx);
+                    if let Some(answer) = internal.round_answers.remove(&old_sid) {
+                        internal.round_answers.insert(self.session_id.clone(), answer);
+                    }
                 }
 
                 let state = ctx.state_mut::<TriviaState>().unwrap();
@@ -204,7 +207,7 @@ pub struct Restart {
 impl Command<TriviaRoom> for Restart {
     fn execute<'a>(
         self: Box<Self>,
-        room: &'a mut TriviaRoom,
+        _room: &'a mut TriviaRoom,
         ctx: &'a mut RoomContext,
         d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
@@ -223,8 +226,8 @@ impl Command<TriviaRoom> for Restart {
                     *p = PlayerState::new(p.user_id.clone(), p.name.clone());
                 }
             }
-            room.pending_questions.clear();
-            room.correct_index = None;
+            TriviaRoom::internal_mut(ctx).pending_questions.clear();
+            TriviaRoom::internal_mut(ctx).correct_index = None;
             // pre-generate the next game's questions while players ready up
             d.enqueue(crate::commands::GenerateQuestions);
             ctx.broadcast("system", &json!({ "text": "back to lobby — ready up!" }));
@@ -249,6 +252,7 @@ pub fn sync_meta(ctx: &mut RoomContext) {
 mod tests {
     use super::*;
     use crate::llm::LlmClient;
+    use crate::state::TriviaInternal;
     use colyseus::Dispatchable;
     use std::sync::Arc;
 
@@ -256,6 +260,7 @@ mod tests {
         let room = TriviaRoom::new(Arc::new(LlmClient::from_env()), None);
         let mut ctx = RoomContext::default();
         ctx.set_state(TriviaState::new("easy", "test"));
+        ctx.set_internal(TriviaInternal::default());
         ctx.state_mut::<TriviaState>().unwrap().phase = phase.into();
         (room, ctx)
     }

@@ -121,6 +121,35 @@ fn edit_at_path(root: &mut Value, path: &[String], edit: &StateEdit) -> Result<(
     }
 }
 
+/// Holds the room's private (server-only) serializable state.
+///
+/// Like [`StateSlot`] but never broadcast to clients and carries no diff
+/// snapshot: it exists purely so server-side game data can survive restarts.
+pub(crate) struct InternalSlot {
+    typed: Box<dyn ErasedState>,
+}
+
+impl InternalSlot {
+    pub fn new<S: Serialize + DeserializeOwned + Send + 'static>(state: S) -> Self {
+        InternalSlot {
+            typed: Box::new(state),
+        }
+    }
+
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.typed.as_any().downcast_ref::<T>()
+    }
+
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.typed.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// The current full value (serialized into snapshots).
+    pub fn full(&self) -> Value {
+        self.typed.to_value()
+    }
+}
+
 /// Holds the room's state plus the snapshot of the last broadcast.
 pub(crate) struct StateSlot {
     typed: Box<dyn ErasedState>,

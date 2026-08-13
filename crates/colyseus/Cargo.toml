@@ -9,6 +9,7 @@ license = "MIT"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
+crc32fast = "1"
 dashmap = "6"
 futures = "0.3"
 json-patch = "4"

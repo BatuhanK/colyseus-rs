@@ -31,6 +31,7 @@
 pub mod protocol;
 pub mod presence;
 pub mod driver;
+pub mod snapshot;
 
 mod actor;
 mod admin;
@@ -57,4 +58,5 @@ pub use presence::{LocalPresence, Presence};
 pub use protocol::MessageType;
 pub use room::{BoxFuture, BroadcastOptions, Room, RoomContext};
 pub use server::Server;
+pub use snapshot::{FileSnapshotStore, PersistenceConfig, RoomSnapshot, SnapshotStore};
 pub use utils::Clock;

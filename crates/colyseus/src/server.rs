@@ -32,6 +32,7 @@ use crate::matchmaker::{AuthContext, MatchMaker, RegisteredHandler};
 use crate::presence::Presence;
 use crate::protocol::{self, ClientMessage};
 use crate::room::Room;
+use crate::snapshot::PersistenceConfig;
 
 /// The game server. Register room types, then [`Server::listen`].
 pub struct Server {
@@ -45,6 +46,8 @@ pub struct Server {
     ws_write_buffer_size: Option<usize>,
     /// `Some` = admin panel enabled (inner Option = bearer token).
     admin: Option<Option<String>>,
+    /// Snapshot persistence configuration.
+    persistence: Option<PersistenceConfig>,
 }
 
 impl Default for Server {
@@ -65,6 +68,7 @@ impl Server {
             ws_read_buffer_size: None,
             ws_write_buffer_size: None,
             admin: None,
+            persistence: None,
         }
     }
 
@@ -101,6 +105,22 @@ impl Server {
     /// ```
     pub fn admin_panel(mut self, token: Option<String>) -> Self {
         self.admin = Some(token);
+        self
+    }
+
+    /// Enable room persistence. Rooms snapshot their state (public + internal)
+    /// to a [`SnapshotStore`](crate::snapshot::SnapshotStore) and are restored
+    /// automatically on startup — before any traffic is accepted.
+    ///
+    /// ```ignore
+    /// use colyseus::snapshot::{FileSnapshotStore, PersistenceConfig};
+    ///
+    /// let server = Server::new().persistence(PersistenceConfig::new(
+    ///     FileSnapshotStore::new("./snapshots"),
+    /// ));
+    /// ```
+    pub fn persistence(mut self, config: PersistenceConfig) -> Self {
+        self.persistence = Some(config);
         self
     }
 
@@ -148,7 +168,7 @@ impl Server {
     /// Build the axum router and the matchmaker handle. Useful for embedding
     /// into an existing axum app or for tests.
     pub fn build(self) -> (Router, MatchMaker) {
-        let mm = MatchMaker::new(self.presence, self.public_address);
+        let mm = MatchMaker::new(self.presence, self.public_address, self.persistence);
         for (_, handler) in self.handlers {
             mm.register(handler);
         }
@@ -186,6 +206,10 @@ impl Server {
     pub async fn listen(self, addr: &str) -> Result<()> {
         self.greet_banner(addr);
         let (app, mm) = self.build();
+
+        // Restore persisted rooms before accepting any traffic.
+        let restored = mm.restore_all().await;
+        tracing::info!("restored {} room(s) from snapshots", restored.len());
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await

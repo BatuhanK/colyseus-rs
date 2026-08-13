@@ -12,11 +12,12 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
-use crate::actor::{spawn_room, RoomEvent, RoomHandle};
+use crate::actor::{spawn_restored_room, spawn_room, RoomEvent, RoomHandle};
 use crate::driver::{Conditions, LocalDriver, RoomListing, SortOptions};
 use crate::error::{codes, Result, ServerError};
 use crate::presence::{LocalPresence, Presence};
 use crate::room::{Room, RoomContext};
+use crate::snapshot::{PersistenceConfig, PersistenceHandle, SnapshotStore, SnapshotWriter};
 use crate::utils::generate_id;
 
 const RESERVE_SEAT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +48,8 @@ pub struct RegisteredHandler {
     sort_by: SortOptions,
     default_options: Option<Value>,
     internal: bool,
+    /// Whether rooms of this type are persisted/restored. Default `true`.
+    persistent: bool,
 }
 
 impl RegisteredHandler {
@@ -62,6 +65,7 @@ impl RegisteredHandler {
             sort_by: Vec::new(),
             default_options: None,
             internal: false,
+            persistent: true,
         }
     }
 
@@ -76,6 +80,18 @@ impl RegisteredHandler {
 
     pub fn is_internal(&self) -> bool {
         self.internal
+    }
+
+    /// Whether rooms of this type are persisted to snapshots. Mark bootstrap
+    /// / global rooms (e.g. a chat lobby recreated at startup) as
+    /// non-persistent so they are neither saved nor restored.
+    pub fn persistent(&mut self, persistent: bool) -> &mut Self {
+        self.persistent = persistent;
+        self
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
     }
 
     /// Which client option fields are used to filter rooms during matchmaking.
@@ -164,6 +180,10 @@ struct MatchMakerInner {
     lobby_tx: broadcast::Sender<MatchmakerEvent>,
     /// Prevents concurrent creation of rooms with identical filter criteria.
     create_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Snapshot persistence (when configured on the server).
+    store: Option<Arc<dyn SnapshotStore>>,
+    writer: Option<SnapshotWriter>,
+    persistence: Option<PersistenceConfig>,
 }
 
 /// The matchmaker. Cloneable handle, safe to share across tasks.
@@ -173,7 +193,11 @@ pub struct MatchMaker {
 }
 
 impl MatchMaker {
-    pub(crate) fn new(presence: Option<Arc<dyn Presence>>, public_address: Option<String>) -> Self {
+    pub(crate) fn new(
+        presence: Option<Arc<dyn Presence>>,
+        public_address: Option<String>,
+        persistence: Option<PersistenceConfig>,
+    ) -> Self {
         MatchMaker {
             inner: Arc::new(MatchMakerInner {
                 handlers: RwLock::new(HashMap::new()),
@@ -185,6 +209,11 @@ impl MatchMaker {
                 shutting_down: AtomicBool::new(false),
                 lobby_tx: broadcast::channel(256).0,
                 create_locks: DashMap::new(),
+                store: persistence.as_ref().map(|p| p.store.clone()),
+                writer: persistence
+                    .as_ref()
+                    .map(|p| SnapshotWriter::spawn(p.store.clone())),
+                persistence,
             }),
         }
     }
@@ -211,6 +240,14 @@ impl MatchMaker {
 
     pub fn process_id(&self) -> &str {
         &self.inner.process_id
+    }
+
+    /// The persistence handle handed to every room (when configured).
+    fn persistence_handle(&self) -> Option<PersistenceHandle> {
+        self.inner.persistence.as_ref().map(|c| PersistenceHandle {
+            config: c.clone(),
+            writer: self.inner.writer.clone().expect("snapshot writer"),
+        })
     }
 
     pub fn driver(&self) -> Arc<LocalDriver> {
@@ -411,6 +448,10 @@ impl MatchMaker {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         self.inner.driver.clear();
+        // make sure every queued snapshot write hits disk before we exit
+        if let Some(writer) = &self.inner.writer {
+            writer.flush();
+        }
     }
 
     /// Server-side: create a room without reserving a seat — for bootstrap
@@ -418,6 +459,119 @@ impl MatchMaker {
     /// (Clients use the matchmaking HTTP API, which always reserves a seat.)
     pub async fn create_room(&self, room_name: &str, options: Value) -> Result<RoomListing> {
         self.create_room_inner(room_name, options).await
+    }
+
+    /// Restore a single persisted room by id.
+    ///
+    /// Returns `Ok(None)` when the snapshot was skipped (its room type is
+    /// marked non-persistent, so the stale snapshot is dropped).
+    pub async fn restore_room(&self, room_id: &str) -> Result<Option<RoomListing>> {
+        let Some(store) = self.inner.store.clone() else {
+            return Err(ServerError::new(
+                codes::APPLICATION_ERROR,
+                "no snapshot store configured",
+            ));
+        };
+        let Some(bytes) = store.load(room_id) else {
+            return Err(ServerError::room_not_found(room_id));
+        };
+        let snapshot = match crate::snapshot::decode_snapshot(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                store.quarantine(room_id, &e);
+                return Err(ServerError::new(
+                    codes::APPLICATION_ERROR,
+                    format!("corrupt snapshot for {room_id}: {e}"),
+                ));
+            }
+        };
+
+        if self.inner.rooms.contains_key(&snapshot.room_id) {
+            return Err(ServerError::new(
+                codes::APPLICATION_ERROR,
+                format!("room {} is already running", snapshot.room_id),
+            ));
+        }
+
+        let handler = match self.handler(&snapshot.room_name) {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::warn!(
+                    "snapshot for {room_id} references unregistered room type {}; skipping",
+                    snapshot.room_name
+                );
+                return Err(ServerError::no_handler(&snapshot.room_name));
+            }
+        };
+
+        if !handler.is_persistent() {
+            let _ = store.delete(room_id);
+            tracing::info!(
+                "dropping snapshot for non-persistent room type {} ({room_id})",
+                snapshot.room_name
+            );
+            return Ok(None);
+        }
+
+        let room = (handler.factory)();
+        let ctx = RoomContext::new(
+            snapshot.room_id.clone(),
+            snapshot.room_name.clone(),
+            self.inner.process_id.clone(),
+            self.inner.driver.clone(),
+            self.inner.presence.clone(),
+            self.inner.lobby_tx.clone(),
+            snapshot.filter_extra.clone(),
+            self.persistence_handle(),
+        );
+
+        let rooms = self.inner.rooms.clone();
+        let cleanup_room_id = snapshot.room_id.clone();
+        let (handle, listing) = spawn_restored_room(
+            room,
+            ctx,
+            snapshot,
+            Box::new(move || {
+                rooms.remove(&cleanup_room_id);
+            }),
+        )
+        .await?;
+
+        self.inner.rooms.insert(listing.room_id.clone(), handle);
+        self.inner.driver.insert(listing.clone());
+        let _ = self
+            .inner
+            .lobby_tx
+            .send(MatchmakerEvent::RoomCreated(listing.clone()));
+        tracing::info!(
+            "restored room {} (roomId: {}) from snapshot",
+            listing.name,
+            listing.room_id
+        );
+        Ok(Some(listing))
+    }
+
+    /// Restore all persisted rooms. Call before accepting traffic (the server
+    /// does this automatically in [`crate::Server::listen`]).
+    ///
+    /// Returns the room ids that were successfully restored.
+    pub async fn restore_all(&self) -> Vec<String> {
+        let Some(store) = self.inner.store.clone() else {
+            return Vec::new();
+        };
+        let ids = store.list_room_ids();
+        tracing::info!("restoring {} room(s) from snapshots", ids.len());
+        let mut restored = Vec::new();
+        for room_id in ids {
+            match self.restore_room(&room_id).await {
+                Ok(Some(_)) => restored.push(room_id),
+                Ok(None) => {} // skipped (non-persistent room type)
+                Err(e) => {
+                    tracing::warn!("failed to restore room {room_id}: {e}");
+                }
+            }
+        }
+        restored
     }
 
     // ------------------------------------------------------------------
@@ -438,6 +592,11 @@ impl MatchMaker {
             self.inner.presence.clone(),
             self.inner.lobby_tx.clone(),
             filter_extra,
+            if handler.is_persistent() {
+                self.persistence_handle()
+            } else {
+                None
+            },
         );
 
         let rooms = self.inner.rooms.clone();

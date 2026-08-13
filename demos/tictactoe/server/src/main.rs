@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use colyseus::serde_json::{json, Value};
 use colyseus::{
-    async_trait, codes, AuthContext, Client, Result, Room, RoomContext, Server, ServerError,
+    async_trait, codes, AuthContext, Client, FileSnapshotStore, PersistenceConfig, Result, Room,
+    RoomContext, RoomSnapshot, Server, ServerError,
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,11 @@ impl Room for TicTacToeRoom {
         Ok(())
     }
 
+    async fn on_restore(&mut self, ctx: &mut RoomContext, snapshot: &RoomSnapshot) -> Result<()> {
+        ctx.restore_state::<TttState>(snapshot)?;
+        Ok(())
+    }
+
     async fn on_auth(
         &mut self,
         _ctx: &mut RoomContext,
@@ -315,7 +321,8 @@ async fn main() {
 
     let mut server = Server::new()
         .ws_buffer_sizes(16 * 1024, 32 * 1024)
-        .public_address("localhost:2567");
+        .public_address("localhost:2567")
+        .persistence(PersistenceConfig::new(FileSnapshotStore::new("./snapshots")));
     server.define("tictactoe", || TicTacToeRoom);
     server.listen("0.0.0.0:2567").await.unwrap();
 }

@@ -16,13 +16,14 @@ use async_openai::{
     },
     Client,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 /// A generated question. Choices are shuffled; `answer_index` points into
 /// the shuffled list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
     pub text: String,
     pub choices: Vec<String>,

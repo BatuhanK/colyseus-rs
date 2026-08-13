@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use colyseus::serde_json::{json, Value};
-use colyseus::{async_trait, Client, Result, Room, RoomContext, Server};
+use colyseus::{async_trait, Client, Result, Room, RoomContext, RoomSnapshot, Server};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -182,6 +182,52 @@ impl Room for StateRoom {
 
     async fn on_drop(&mut self, ctx: &mut RoomContext, client: Client, _code: u16) {
         ctx.allow_reconnection(&client, Some(Duration::from_secs(30)));
+    }
+
+    async fn on_reconnect(&mut self, ctx: &mut RoomContext, client: Client) {
+        client.send("reconnected", &json!({ "ok": true }));
+        let _ = ctx;
+    }
+}
+
+/// Room with both public state and server-only internal state, both persisted.
+#[derive(Serialize, Deserialize)]
+struct PersistentInternal {
+    secret_value: i64,
+}
+
+struct PersistentRoom;
+
+#[async_trait]
+impl Room for PersistentRoom {
+    async fn on_create(&mut self, ctx: &mut RoomContext, _options: Value) -> Result<()> {
+        ctx.set_state(Counter { count: 0 });
+        ctx.set_internal(PersistentInternal { secret_value: 1 });
+        ctx.set_patch_rate(Some(Duration::from_millis(20)));
+        ctx.on_message(
+            "increment",
+            |_room: &mut PersistentRoom, ctx, _client, msg: Increment| {
+                Box::pin(async move {
+                    ctx.state_mut::<Counter>().unwrap().count += msg.by;
+                    ctx.internal_mut::<PersistentInternal>().unwrap().secret_value += msg.by;
+                    Ok(())
+                })
+            },
+        );
+        ctx.on_message("report", |_room: &mut PersistentRoom, ctx, _client, _msg: Value| {
+            Box::pin(async move {
+                let secret = ctx.internal::<PersistentInternal>().unwrap().secret_value;
+                ctx.broadcast("report", &json!({ "secret": secret }));
+                Ok(())
+            })
+        });
+        Ok(())
+    }
+
+    async fn on_restore(&mut self, ctx: &mut RoomContext, snapshot: &RoomSnapshot) -> Result<()> {
+        ctx.restore_state::<Counter>(snapshot)?;
+        ctx.restore_internal::<PersistentInternal>(snapshot)?;
+        Ok(())
     }
 
     async fn on_reconnect(&mut self, ctx: &mut RoomContext, client: Client) {
@@ -611,4 +657,151 @@ async fn view_filter_sends_per_client_state() {
     );
     let serialized = Value::Array(ops2.clone()).to_string();
     assert!(!serialized.contains(&sid1), "client 2 received client 1's data");
+}
+
+#[tokio::test]
+async fn persistence_restores_state_and_internal_across_restart() {
+    use colyseus::snapshot::{FileSnapshotStore, PersistenceConfig};
+
+    let dir = std::env::temp_dir().join(format!("colyseus-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = PersistenceConfig::new(FileSnapshotStore::new(dir.clone()))
+        .auto_save_interval(Duration::from_millis(10));
+
+    let room_id;
+
+    // ---- server A: create, mutate, shutdown (snapshot is written) ----
+    {
+        let mut server = Server::new().persistence(cfg.clone());
+        server.define("persist", || PersistentRoom);
+        let (app, mm) = server.build();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let base = format!("http://{addr}");
+
+        let r = matchmake(&base, "joinOrCreate", "persist", json!({})).await;
+        room_id = r["room"]["roomId"].as_str().unwrap().to_string();
+        let mut c = WsClient::connect(&base, &r).await;
+        let _handshake = c.recv().await;
+        let _full = c.recv().await;
+
+        c.send("increment", json!({ "by": 7 })).await;
+        let _patch = c.recv().await;
+        tokio::time::sleep(Duration::from_millis(200)).await; // let the auto-save fire
+
+        mm.shutdown().await; // disposes rooms and flushes the snapshot writer
+        handle.abort();
+    }
+
+    // ---- server B: restores the room before accepting traffic ----
+    {
+        let mut server = Server::new().persistence(cfg);
+        server.define("persist", || PersistentRoom);
+        let (app, mm) = server.build();
+
+        let restored = mm.restore_all().await;
+        assert_eq!(restored, vec![room_id.clone()], "room should be restored on boot");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let base = format!("http://{addr}");
+
+        // the restored room is reachable by its original id
+        let r = matchmake(&base, "joinById", &room_id, json!({})).await;
+        assert_eq!(r["room"]["roomId"], room_id);
+        let mut c = WsClient::connect(&base, &r).await;
+        let _handshake = c.recv().await;
+
+        // public state survived
+        let full = c.recv().await;
+        assert_eq!(full[0], 14);
+        assert_eq!(full[1]["count"], 7, "public state should be restored");
+
+        // server-only internal state survived (verified via a broadcast)
+        c.send("report", json!({})).await;
+        let report = c.recv().await;
+        assert_eq!(report[1], "report");
+        assert_eq!(report[2]["secret"], 8, "internal state should be restored");
+
+        mm.shutdown().await;
+        handle.abort();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn persistence_preserves_reconnection_token_across_restart() {
+    use colyseus::snapshot::{FileSnapshotStore, PersistenceConfig};
+
+    let dir = std::env::temp_dir().join(format!("colyseus-persist-rc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = PersistenceConfig::new(FileSnapshotStore::new(dir.clone()))
+        .auto_save_interval(Duration::from_millis(10));
+
+    let (room_id, session_id, token);
+
+    // ---- server A: connect, mutate, graceful shutdown ----
+    {
+        let mut server = Server::new().persistence(cfg.clone());
+        server.define("persist", || PersistentRoom);
+        let (app, mm) = server.build();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let base = format!("http://{addr}");
+
+        let r = matchmake(&base, "joinOrCreate", "persist", json!({})).await;
+        room_id = r["room"]["roomId"].as_str().unwrap().to_string();
+        session_id = r["sessionId"].as_str().unwrap().to_string();
+        let mut c = WsClient::connect(&base, &r).await;
+        let handshake = c.recv().await;
+        token = handshake[1].as_str().unwrap().to_string();
+        let _full = c.recv().await;
+        c.send("increment", json!({ "by": 5 })).await;
+        let _patch = c.recv().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        mm.shutdown().await;
+        handle.abort();
+    }
+
+    // ---- server B: restore, then reconnect with the original token ----
+    {
+        let mut server = Server::new().persistence(cfg);
+        server.define("persist", || PersistentRoom);
+        let (app, mm) = server.build();
+        assert_eq!(mm.restore_all().await, vec![room_id.clone()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let base = format!("http://{addr}");
+
+        // the persisted token is still valid after the restart
+        let r2 = matchmake(
+            &base,
+            "reconnect",
+            &room_id,
+            json!({ "reconnectionToken": token }),
+        )
+        .await;
+        assert_eq!(r2["sessionId"], session_id, "same seat should be re-seated");
+
+        let mut c2 = WsClient::connect_with_token(&base, &r2, Some(&token)).await;
+        let handshake2 = c2.recv().await;
+        assert_eq!(handshake2[0], 10);
+        let full2 = c2.recv().await;
+        assert_eq!(full2[1]["count"], 5, "state preserved across restart + reconnect");
+        let note = c2.recv().await;
+        assert_eq!(note[1], "reconnected");
+
+        mm.shutdown().await;
+        handle.abort();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -15,6 +15,7 @@ use crate::error::{close_codes, codes, Result, ServerError};
 use crate::matchmaker::{AuthContext, MatchmakerEvent};
 use crate::protocol::{self, ClientMessage};
 use crate::room::{BoxFuture, ReservedSeat, Room, RoomContext};
+use crate::snapshot::RoomSnapshot;
 use crate::utils::generate_id;
 
 /// Events the room actor processes.
@@ -166,11 +167,64 @@ pub(crate) async fn spawn_room(
     options: Value,
     on_dispose: OnDispose,
 ) -> Result<(RoomHandle, RoomListing)> {
+    ctx.create_options = options.clone();
+
+    // The sender must be available *during* `on_create` (rooms can use
+    // `ctx.sender()` to spawn background work there).
     let (tx, rx) = mpsc::unbounded_channel();
     ctx.set_sender(RoomSender { tx: tx.clone() });
-    let tap = ctx.tap.clone();
 
     room.on_create(&mut ctx, options).await?;
+    ctx.schema_version = room.schema_version();
+    finish_spawn(room, ctx, tx, rx, on_dispose).await
+}
+
+/// Restore a room from a snapshot, run `on_restore`, and spawn its actor task.
+pub(crate) async fn spawn_restored_room(
+    mut room: Box<dyn Room>,
+    mut ctx: RoomContext,
+    mut snapshot: RoomSnapshot,
+    on_dispose: OnDispose,
+) -> Result<(RoomHandle, RoomListing)> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    ctx.set_sender(RoomSender { tx: tx.clone() });
+
+    // `on_create` always runs first so message handlers and defaults are
+    // re-registered; `on_restore` then overlays the persisted state.
+    room.on_create(&mut ctx, snapshot.options.clone()).await?;
+
+    let current = room.schema_version();
+    if snapshot.schema_version < current {
+        room.on_migrate(snapshot.schema_version, &mut snapshot)?;
+        snapshot.schema_version = current;
+    } else if snapshot.schema_version > current {
+        return Err(ServerError::new(
+            codes::APPLICATION_ERROR,
+            format!(
+                "snapshot schema version {} is newer than room version {}",
+                snapshot.schema_version, current
+            ),
+        ));
+    }
+
+    room.on_restore(&mut ctx, &snapshot).await?;
+
+    // Framework-managed fields (clock, metadata, seats, reconnections) are
+    // applied last so persisted values win over `on_create` defaults.
+    ctx.apply_snapshot(&snapshot);
+
+    ctx.schema_version = current;
+    finish_spawn(room, ctx, tx, rx, on_dispose).await
+}
+
+async fn finish_spawn(
+    room: Box<dyn Room>,
+    ctx: RoomContext,
+    tx: mpsc::UnboundedSender<RoomEvent>,
+    rx: mpsc::UnboundedReceiver<RoomEvent>,
+    on_dispose: OnDispose,
+) -> Result<(RoomHandle, RoomListing)> {
+    let tap = ctx.tap.clone();
 
     let listing = ctx.build_listing();
     let handle = RoomHandle {
@@ -189,6 +243,7 @@ pub(crate) async fn spawn_room(
         patch: None,
         patch_cfg: None,
         last_tick: Instant::now(),
+        last_auto_save: None,
         created_at: Instant::now(),
     };
     tokio::spawn(actor.run());
@@ -211,6 +266,7 @@ struct RoomActor {
     patch: Option<Interval>,
     patch_cfg: Option<Duration>,
     last_tick: Instant,
+    last_auto_save: Option<Instant>,
     created_at: Instant,
 }
 
@@ -257,7 +313,10 @@ impl RoomActor {
                     if self.ctx.sim_interval.is_none() {
                         self.ctx.clock.tick();
                     }
-                    self.ctx.broadcast_patch();
+                    let changed = self.ctx.broadcast_patch();
+                    if changed {
+                        self.maybe_auto_save();
+                    }
                 }
 
                 _ = async {
@@ -355,6 +414,28 @@ impl RoomActor {
         }
         // never had a client: dispose if nobody showed up within the seat timeout
         self.created_at.elapsed() >= self.ctx.seat_reservation_timeout
+    }
+
+    /// Debounced automatic snapshot write after a state change.
+    fn maybe_auto_save(&mut self) {
+        if self.ctx.persistence.is_none() {
+            return;
+        }
+        if self.ctx.state_slot.is_none() && self.ctx.internal_slot.is_none() {
+            return;
+        }
+        let Some(p) = self.ctx.persistence.clone() else {
+            return;
+        };
+        let interval = p.config.auto_save_interval;
+        let now = Instant::now();
+        if self
+            .last_auto_save
+            .map_or(true, |t| now.duration_since(t) >= interval)
+        {
+            self.last_auto_save = Some(now);
+            self.ctx.persist_now();
+        }
     }
 
     async fn handle_event(&mut self, ev: RoomEvent) -> Flow {
@@ -837,6 +918,16 @@ impl RoomActor {
         }
         self.ctx.disposing = true;
         self.ctx.request_dispose = None;
+
+        // Final snapshot decision — before clearing clients/reconnections so
+        // persisted reconnection seats survive the restart.
+        if let Some(p) = self.ctx.persistence.clone() {
+            if p.config.delete_on_dispose {
+                self.ctx.delete_snapshot();
+            } else if p.config.save_on_dispose {
+                self.ctx.persist_now();
+            }
+        }
 
         let clients = std::mem::take(&mut self.ctx.clients);
         for client in clients {

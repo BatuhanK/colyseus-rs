@@ -64,7 +64,7 @@ pub struct Answer {
 impl Command<TriviaRoom> for Answer {
     fn execute<'a>(
         self: Box<Self>,
-        room: &'a mut TriviaRoom,
+        _room: &'a mut TriviaRoom,
         ctx: &'a mut RoomContext,
         d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
@@ -82,8 +82,10 @@ impl Command<TriviaRoom> for Answer {
                 }
                 p.answered = true;
                 state.answers_in += 1;
-                room.round_answers.insert(self.session_id, self.choice);
             }
+            TriviaRoom::internal_mut(ctx)
+                .round_answers
+                .insert(self.session_id, self.choice);
 
             let all_answered = {
                 let state = ctx.state::<TriviaState>().unwrap();
@@ -107,10 +109,12 @@ impl Command<TriviaRoom> for GenerateQuestions {
         _d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if room.batch_in_flight || room.pending_questions.len() >= TOTAL_ROUNDS as usize {
+            if TriviaRoom::internal(ctx).batch_in_flight
+                || TriviaRoom::internal(ctx).pending_questions.len() >= TOTAL_ROUNDS as usize
+            {
                 return;
             }
-            room.batch_in_flight = true;
+            TriviaRoom::internal_mut(ctx).batch_in_flight = true;
 
             let (difficulty, category) = {
                 let state = ctx.state::<TriviaState>().unwrap();
@@ -146,17 +150,20 @@ impl Command<TriviaRoom> for QuestionsReady {
         d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            room.batch_in_flight = false;
             room.llm.record_asked(self.questions.iter().map(|q| q.text.clone()));
-            for (i, q) in self.questions.into_iter().enumerate() {
-                room.pending_questions.insert(i as u32 + 1, q);
+            {
+                let internal = TriviaRoom::internal_mut(ctx);
+                internal.batch_in_flight = false;
+                for (i, q) in self.questions.into_iter().enumerate() {
+                    internal.pending_questions.insert(i as u32 + 1, q);
+                }
             }
 
             // if the game is waiting on round 1, kick it off now
-            if room.needed_round == Some(1)
+            if TriviaRoom::internal(ctx).needed_round == Some(1)
                 && ctx.state::<TriviaState>().unwrap().phase == "generating"
             {
-                room.needed_round = None;
+                TriviaRoom::internal_mut(ctx).needed_round = None;
                 d.enqueue(StartRound { round: 1 });
             }
         })
@@ -177,24 +184,29 @@ impl Command<TriviaRoom> for StartRound {
         d: &'a mut Dispatcher<TriviaRoom>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let question = match room.pending_questions.remove(&self.round) {
+            let question = match TriviaRoom::internal_mut(ctx).pending_questions.remove(&self.round) {
                 Some(q) => q,
                 None => {
                     // batch not ready yet — wait in the generating phase
-                    if !room.batch_in_flight {
+                    if !TriviaRoom::internal(ctx).batch_in_flight {
                         d.enqueue(GenerateQuestions);
                     }
-                    let state = ctx.state_mut::<TriviaState>().unwrap();
-                    state.phase = "generating".into();
-                    state.phase_ends_at = None;
-                    room.needed_round = Some(self.round);
+                    {
+                        let state = ctx.state_mut::<TriviaState>().unwrap();
+                        state.phase = "generating".into();
+                        state.phase_ends_at = None;
+                    }
+                    TriviaRoom::internal_mut(ctx).needed_round = Some(self.round);
                     sync_meta(ctx);
                     return;
                 }
             };
 
-            room.correct_index = Some(question.answer_index);
-            room.round_answers.clear();
+            {
+                let internal = TriviaRoom::internal_mut(ctx);
+                internal.correct_index = Some(question.answer_index);
+                internal.round_answers.clear();
+            }
 
             {
                 let state = ctx.state_mut::<TriviaState>().unwrap();
@@ -240,8 +252,10 @@ impl Command<TriviaRoom> for EndRound {
             }
 
             let points = points_for(&ctx.state::<TriviaState>().unwrap().difficulty);
-            let correct = room.correct_index;
-            let answers = std::mem::take(&mut room.round_answers);
+            let (correct, answers) = {
+                let internal = TriviaRoom::internal_mut(ctx);
+                (internal.correct_index, std::mem::take(&mut internal.round_answers))
+            };
 
             {
                 let state = ctx.state_mut::<TriviaState>().unwrap();
@@ -347,7 +361,7 @@ impl Command<TriviaRoom> for FinishGame {
 mod tests {
     use super::*;
     use crate::llm::LlmClient;
-    use crate::state::PlayerState;
+    use crate::state::{PlayerState, TriviaInternal};
     use colyseus::Dispatchable;
     use std::sync::Arc;
 
@@ -355,6 +369,7 @@ mod tests {
         let room = TriviaRoom::new(Arc::new(LlmClient::from_env()), None);
         let mut ctx = RoomContext::default();
         ctx.set_state(TriviaState::new("medium", "test"));
+        ctx.set_internal(TriviaInternal::default());
         (room, ctx)
     }
 
@@ -370,9 +385,12 @@ mod tests {
             state.players.insert("a".into(), PlayerState::new("ua".into(), "alice".into()));
             state.players.insert("b".into(), PlayerState::new("ub".into(), "bob".into()));
         }
-        room.correct_index = Some(2);
-        room.round_answers.insert("a".into(), 2); // correct
-        room.round_answers.insert("b".into(), 0); // wrong
+        {
+            let internal = TriviaRoom::internal_mut(&mut ctx);
+            internal.correct_index = Some(2);
+            internal.round_answers.insert("a".into(), 2); // correct
+            internal.round_answers.insert("b".into(), 0); // wrong
+        }
 
         room.dispatch(&mut ctx, EndRound).await;
 
@@ -410,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn start_round_uses_pending_question() {
         let (mut room, mut ctx) = test_room();
-        room.pending_questions.insert(
+        TriviaRoom::internal_mut(&mut ctx).pending_questions.insert(
             1,
             Question {
                 text: "q?".into(),
@@ -425,13 +443,13 @@ mod tests {
         assert_eq!(state.phase, "question");
         assert_eq!(state.question.as_ref().unwrap().text, "q?");
         assert_eq!(state.correct_index, None); // hidden until reveal
-        assert_eq!(room.correct_index, Some(2));
+        assert_eq!(TriviaRoom::internal(&ctx).correct_index, Some(2));
 
         // round 2 has nothing prefetched → generating + batch requested
         room.dispatch(&mut ctx, StartRound { round: 2 }).await;
         let state = ctx.state::<TriviaState>().unwrap();
         assert_eq!(state.phase, "generating");
-        assert_eq!(room.needed_round, Some(2));
+        assert_eq!(TriviaRoom::internal(&ctx).needed_round, Some(2));
     }
 
     /// QuestionsReady fills the pending map and kicks a waiting game off.
@@ -442,7 +460,7 @@ mod tests {
             let state = ctx.state_mut::<TriviaState>().unwrap();
             state.phase = "generating".into();
         }
-        room.needed_round = Some(1);
+        TriviaRoom::internal_mut(&mut ctx).needed_round = Some(1);
 
         let questions: Vec<Question> = (0..TOTAL_ROUNDS)
             .map(|i| Question {
@@ -457,6 +475,9 @@ mod tests {
         let state = ctx.state::<TriviaState>().unwrap();
         assert_eq!(state.phase, "question");
         assert_eq!(state.round, 1);
-        assert_eq!(room.pending_questions.len(), (TOTAL_ROUNDS - 1) as usize);
+        assert_eq!(
+            TriviaRoom::internal(&ctx).pending_questions.len(),
+            (TOTAL_ROUNDS - 1) as usize
+        );
     }
 }

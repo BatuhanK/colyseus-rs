@@ -5,4 +5,4 @@ mod lobby;
 mod round;
 
 pub use lobby::{Chat, Join, Leave, Restart, ToggleReady};
-pub use round::{Answer, EndRound, FinishGame, GenerateQuestions, StartGame};
+pub use round::{Advance, Answer, EndRound, FinishGame, GenerateQuestions, StartGame};

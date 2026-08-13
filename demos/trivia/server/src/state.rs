@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const TOTAL_ROUNDS: u32 = 10;
+use crate::llm::Question;
+
+pub const TOTAL_ROUNDS: u32 = 3;
 pub const ROUND_TIME: std::time::Duration = std::time::Duration::from_secs(20);
 pub const REVEAL_BREAK: std::time::Duration = std::time::Duration::from_secs(5);
 pub const MAX_PLAYERS: usize = 4;
@@ -117,4 +119,25 @@ impl TriviaState {
             .map(|p| p.name.clone())
             .or_else(|| self.spectators.get(session_id).map(|s| s.name.clone()))
     }
+}
+
+/// Server-only (private) game state. Never synchronized to clients, but fully
+/// serializable so it survives restarts via `ctx.set_internal` + snapshots.
+///
+/// Contrast with the transient fields on [`crate::room::TriviaRoom`]
+/// (`round_timer`, `break_timer`, services) which are rebuilt in `on_restore`.
+#[derive(Serialize, Deserialize, Default)]
+pub struct TriviaInternal {
+    /// Room password (the password itself is never exposed in public state).
+    pub password: Option<String>,
+    /// Correct answer for the current round; revealed only at round end.
+    pub correct_index: Option<usize>,
+    /// session_id → locked-in choice for the current round.
+    pub round_answers: HashMap<String, usize>,
+    /// round → prefetched question (the whole game is generated up front).
+    pub pending_questions: HashMap<u32, Question>,
+    /// A question batch is currently being generated in the background.
+    pub batch_in_flight: bool,
+    /// A round is waiting for its questions to arrive.
+    pub needed_round: Option<u32>,
 }
