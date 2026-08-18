@@ -46,6 +46,11 @@ pub(crate) enum RoomEvent {
     /// External command injected via [`RoomSender`] (e.g. result of a
     /// background task like an LLM call, or a Redis subscription).
     Command(Box<CommandFn>),
+    /// Admin room RPC: typed request/response operation run on this room actor.
+    CallRoomRpc {
+        cmd: Box<RoomRpcFn>,
+        respond: oneshot::Sender<Result<Value>>,
+    },
     /// Admin panel: report room internals.
     Inspect {
         respond: oneshot::Sender<RoomInspection>,
@@ -98,6 +103,14 @@ pub struct ClientInspection {
 
 pub(crate) type CommandFn =
     dyn for<'a> FnOnce(&'a mut dyn Room, &'a mut RoomContext) -> BoxFuture<'a, ()> + Send;
+
+/// A room-RPC command: runs on the room actor with `&mut Room` + `&mut RoomContext`
+/// and produces a JSON value that is returned to the caller (request/response).
+pub(crate) type RoomRpcFn = dyn for<'a> FnOnce(
+    &'a mut dyn Room,
+    &'a mut RoomContext,
+) -> BoxFuture<'a, Result<Value>>
+    + Send;
 
 fn hrtb_command<F>(f: F) -> F
 where
@@ -152,6 +165,14 @@ pub(crate) struct RoomHandle {
     pub room_id: String,
     pub tx: mpsc::UnboundedSender<RoomEvent>,
     pub tap: crate::room::EventTap,
+}
+
+impl RoomHandle {
+    /// A [`RoomSender`] for injecting typed commands into this room (used by
+    /// admin RPCs via [`crate::admin_rpc::AdminContext::command_room`]).
+    pub fn sender(&self) -> RoomSender {
+        RoomSender { tx: self.tx.clone() }
+    }
 }
 
 /// Called when the room is fully disposed (used by the matchmaker for cleanup).
@@ -459,6 +480,10 @@ impl RoomActor {
             RoomEvent::Disconnected { client, code } => self.on_disconnected(client, code).await,
             RoomEvent::Command(cmd) => {
                 cmd(&mut *self.room, &mut self.ctx).await;
+            }
+            RoomEvent::CallRoomRpc { cmd, respond } => {
+                let result = cmd(&mut *self.room, &mut self.ctx).await;
+                let _ = respond.send(result);
             }
             RoomEvent::Inspect { respond } => {
                 let _ = respond.send(RoomInspection {

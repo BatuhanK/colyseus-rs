@@ -19,6 +19,7 @@
 //! | `POST /admin/api/rooms/{id}/message` `{sessionId?, type, data}` | message one client or broadcast |
 //! | `POST /admin/api/rooms/{id}/dispose` | dispose the room (close 4000) |
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -34,8 +35,9 @@ use sysinfo::System;
 use tokio::sync::oneshot;
 
 use crate::actor::{RoomEvent, RoomInspection};
+use crate::admin_rpc::{AdminContext, RoomRpcHandler, RpcFn};
 use crate::driver::RoomListing;
-use crate::error::close_codes;
+use crate::error::{close_codes, codes, ServerError};
 use crate::matchmaker::MatchMaker;
 use crate::protocol::MessageType;
 
@@ -50,16 +52,31 @@ struct AdminState {
     started_at: Instant,
     sys: std::sync::Arc<Mutex<System>>,
     pid: u32,
+    /// Serve the `/admin` HTML panel (false = API-only, e.g. SDK deployments).
+    panel_html: bool,
+    /// Custom admin RPCs registered via `Server::admin_rpc`.
+    rpcs: HashMap<String, RpcFn>,
+    /// Custom room RPCs registered via `Server::room_rpc`.
+    room_rpcs: HashMap<String, RoomRpcHandler>,
 }
 
-/// Build the admin router (panel + JSON API).
-pub(crate) fn router(mm: MatchMaker, token: Option<String>) -> Router {
+/// Build the admin router (panel + JSON API + custom RPCs).
+pub(crate) fn router(
+    mm: MatchMaker,
+    token: Option<String>,
+    panel_html: bool,
+    rpcs: Vec<(String, RpcFn)>,
+    room_rpcs: Vec<(String, RoomRpcHandler)>,
+) -> Router {
     let state = AdminState {
         mm,
         token,
         started_at: Instant::now(),
         sys: std::sync::Arc::new(Mutex::new(System::new())),
         pid: std::process::id(),
+        panel_html,
+        rpcs: rpcs.into_iter().collect(),
+        room_rpcs: room_rpcs.into_iter().collect(),
     };
 
     Router::new()
@@ -73,6 +90,8 @@ pub(crate) fn router(mm: MatchMaker, token: Option<String>) -> Router {
         .route("/admin/api/rooms/{room_id}/dispose", post(dispose_room))
         .route("/admin/api/rooms/{room_id}/state", post(edit_state))
         .route("/admin/api/rooms/{room_id}/events", get(room_events))
+        .route("/admin/api/rooms/{room_id}/rpc/{name}", post(call_room_rpc))
+        .route("/admin/api/rpc/{name}", post(call_rpc))
         .with_state(state)
 }
 
@@ -91,8 +110,12 @@ fn authorize(state: &AdminState, headers: &HeaderMap) -> Response {
 }
 
 /// The panel page itself is public — the JS overlay asks for the token and
-/// the API enforces it.
-async fn panel() -> Response {
+/// the API enforces it. When the panel is disabled (`admin_token` only), the
+/// route is a 404.
+async fn panel(State(state): State<AdminState>) -> Response {
+    if !state.panel_html {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     Html(PANEL_HTML).into_response()
 }
 
@@ -331,6 +354,74 @@ async fn edit_state(
         Ok(Ok(Ok(()))) => StatusCode::NO_CONTENT.into_response(),
         Ok(Ok(Err(msg))) => (StatusCode::BAD_REQUEST, msg).into_response(),
         _ => (StatusCode::GATEWAY_TIMEOUT, "room did not respond").into_response(),
+    }
+}
+
+// ----------------------------------------------------------------------
+// Custom admin RPCs
+// ----------------------------------------------------------------------
+
+/// `POST /admin/api/rpc/{name}` — dispatch a custom admin RPC registered via
+/// `Server::admin_rpc`. The JSON body becomes the RPC's `Params`; the RPC's
+/// serialized `Response` is returned directly (errors use `{ code, error }`).
+async fn call_rpc(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let auth = authorize(&state, &headers);
+    if auth.status() != StatusCode::OK {
+        return auth;
+    }
+
+    let params = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let Some(rpc) = state.rpcs.get(&name) else {
+        return (StatusCode::NOT_FOUND, format!("unknown admin rpc \"{name}\""))
+            .into_response();
+    };
+
+    match rpc(AdminContext::new(state.mm.clone()), params).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => rpc_error_response(e),
+    }
+}
+
+fn rpc_error_response(e: ServerError) -> Response {
+    let status = if e.code == codes::INVALID_PAYLOAD {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::from_u16(e.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+    (status, Json(json!({ "code": e.code, "error": e.message }))).into_response()
+}
+
+/// `POST /admin/api/rooms/{roomId}/rpc/{name}` — dispatch a room-based admin
+/// RPC registered via `Server::room_rpc`. The RPC runs on the room actor with
+/// typed `&mut MyRoom` access and returns its serialized response.
+async fn call_room_rpc(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((room_id, name)): Path<(String, String)>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let auth = authorize(&state, &headers);
+    if auth.status() != StatusCode::OK {
+        return auth;
+    }
+
+    let Some(handle) = state.mm.room_handle(&room_id) else {
+        return (StatusCode::NOT_FOUND, "room not found").into_response();
+    };
+    let Some(rpc) = state.room_rpcs.get(&name) else {
+        return (StatusCode::NOT_FOUND, format!("unknown room rpc \"{name}\""))
+            .into_response();
+    };
+
+    let params = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    match rpc(handle, params).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => rpc_error_response(e),
     }
 }
 

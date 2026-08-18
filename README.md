@@ -102,6 +102,7 @@ cargo run --example game    # state sync, game loop, reconnection
 | Multi-process (Redis driver + IPC) | ✅ | 🔜 trait seams exist, not implemented |
 | Graceful shutdown | ✅ | ✅ (SIGINT/SIGTERM → dispose all rooms) |
 | Admin panel / monitor | `@colyseus/monitor` | ✅ built-in (`/admin`) |
+| Admin SDK / custom RPCs | (ad-hoc / Cloud) | ✅ `admin_token` + `admin_rpc` + TS `AdminClient` |
 | Snapshot persistence (public + internal state, resume after restart) | 🔜 | ✅ |
 | `devMode` room restore | ✅ | 🔜 |
 
@@ -322,7 +323,9 @@ See `demos/trivia` (internal state + re-armed timers) and `demos/tictactoe`
 `tests/integration.rs::persistence_restores_state_and_internal_across_restart`
 for the end-to-end restart test.
 
-## Admin panel (`@colyseus/monitor` counterpart)
+## Admin panel & admin SDK
+
+### Panel (`@colyseus/monitor` counterpart)
 
 ```rust
 Server::new().admin_panel(Some("secret-token".to_string())) // token optional
@@ -340,13 +343,135 @@ source: `crates/colyseus/admin-ui`, regenerate with `npm run build` there):
   messages in/out, broadcasts, state patches with their JSON-Patch ops)
   over `GET /admin/api/rooms/{id}/events` (WebSocket)
 - **Actions**: lock/unlock, kick client, send a message to one client or
-  broadcast, dispose the room
+  broadcast, dispose the room, edit state values in the JSON tree
 
 The JSON API (`/admin/api/*`, bearer-token guarded when set):
-`GET overview` · `GET rooms/{id}` · `POST rooms/{id}/lock|unlock|kick|message|dispose`.
-Unlike the Colyseus monitor, arbitrary state *editing* is intentionally not
-offered: state is a typed Rust struct, not a dynamic schema — mutate it via
-commands instead.
+`GET overview` · `GET rooms/{id}` · `POST rooms/{id}/lock|unlock|kick|message|dispose|state`.
+State edits are validated by a serialize→edit→deserialize round-trip, so type
+mismatches (e.g. a string into an `i64` field) are rejected server-side.
+
+### Admin SDK + custom RPCs (for your own backend)
+
+Register typed, token-guarded RPCs server-side and call them from your
+TypeScript backend. Enable the API (optionally without serving the panel UI)
+and register RPCs:
+
+```rust
+use colyseus::{AdminContext, AdminRpc, Result, Server};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetRoom { room_id: String }
+
+#[derive(Serialize)]
+struct ResetRoomResult { ok: bool }
+
+#[async_trait]
+impl AdminRpc for ResetRoom {
+    type Params = ResetRoom;
+    type Response = ResetRoomResult;
+    async fn call(p: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
+        ctx.dispose_room(&p.room_id);
+        Ok(ResetRoomResult { ok: true })
+    }
+}
+
+let mut server = Server::new();
+server.define("game", || GameRoom);
+let server = server
+    .admin_token(Some("backend-secret".to_string())) // API only, no /admin UI
+    .admin_rpc::<ResetRoom>("resetRoom");
+```
+
+Each RPC is `POST /admin/api/rpc/{name}` with a `Bearer` token. `Params` is
+deserialized from the JSON body; `Response` is serialized as the JSON reply.
+Errors return `{ code, error }` with an HTTP status (invalid params → `400`).
+
+`AdminContext` is the safe handle handed to every RPC:
+
+| method | purpose |
+| --- | --- |
+| `list_rooms(name?)` / `room(id)` | query listings |
+| `create_room(name, options)` | server-side room creation |
+| `inspect_room(id)` | state + clients + seats |
+| `dispose_room(id)` / `lock_room(id)` / `unlock_room(id)` | lifecycle |
+| `kick(id, session_id)` | force-disconnect |
+| `send_message(id, session_id?, type, payload)` | message one client or broadcast |
+| `edit_state` / `set_state_path` / `remove_state_path` | validated state edits |
+| `command_room::<MyRoom>(id, f)` | inject a typed closure into a room actor (`&mut MyRoom`) |
+| `call_room::<MyRoom, Rpc>(id, params)` | run a room RPC from another RPC (request/response) |
+| `presence()` / `subscribe()` | pub/sub + KV, lobby events |
+
+> Conventions: multi-word RPC fields use `camelCase` on the wire (add
+> `#[serde(rename_all = "camelCase")]`) to match the rest of the framework
+> and the TypeScript SDK. For game-specific mutations that need the room's
+> typed state, prefer [`AdminContext::command_room`](crates/colyseus/src/admin_rpc.rs)
+> over raw state edits.
+
+### Room-based RPCs (run on the room actor)
+
+When the logic needs `&mut MyRoom` + `&mut RoomContext` (and should run
+sequentially with the room's own handlers), register a **room RPC** — it runs
+inside the room actor and returns a typed response:
+
+```rust
+use colyseus::{Room, RoomContext, RoomRpc, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdjustScore { player: String, delta: i64 }
+
+#[derive(Serialize, Deserialize)]
+struct ScoreResult { points: i64 }
+
+#[async_trait]
+impl RoomRpc<GameRoom> for AdjustScore {
+    type Params = AdjustScore;
+    type Response = ScoreResult;
+    async fn call(room: &mut GameRoom, ctx: &mut RoomContext, p: AdjustScore) -> Result<ScoreResult> {
+        let state = ctx.state_mut::<GameState>().unwrap();
+        state.scores[p.player].points += p.delta; // typed, lock-free (actor)
+        Ok(ScoreResult { points: state.scores[p.player].points })
+    }
+}
+
+server.room_rpc::<GameRoom, AdjustScore>("adjustScore");
+```
+
+Wire: `POST /admin/api/rooms/{roomId}/rpc/{name}` (body = `Params`). The room id
+is in the path, the RPC name is registered per room type, and a type mismatch
+(room is not a `GameRoom`) returns an error. You can also invoke a room RPC from
+an admin RPC via `ctx.call_room::<GameRoom, AdjustScore>(&room_id, params).await`.
+
+TypeScript side ([`clients/ts/src/admin.ts`](clients/ts/src/admin.ts), no deps):
+
+```ts
+import { AdminClient } from "colyseus-rs-client/admin";
+
+const admin = new AdminClient("http://localhost:2567", "backend-secret");
+
+await admin.listRooms();
+await admin.kick(roomId, sessionId);
+await admin.sendMessage(roomId, "system", { text: "hi" });
+await admin.setStatePath(roomId, "/players/1/score", 100);
+
+// custom RPCs
+const { ok } = await admin.call<{ ok: boolean }>("resetRoom", { roomId });
+
+// room-based RPCs (run on the room actor)
+const score = await admin.callRoom<{ points: number }>(roomId, "adjustScore", {
+  player: "p1",
+  delta: 10,
+});
+
+// live traffic stream
+const close = admin.roomEvents(roomId, (e) => console.log(e.kind));
+```
+
+Runnable: `cargo run --example admin_rpc` then
+`node clients/ts/examples/admin-smoke.mjs`.
 
 ## Demos
 

@@ -44,8 +44,14 @@ pub struct Server {
     greet: bool,
     ws_read_buffer_size: Option<usize>,
     ws_write_buffer_size: Option<usize>,
-    /// `Some` = admin panel enabled (inner Option = bearer token).
-    admin: Option<Option<String>>,
+    /// `true` = serve the admin panel UI at `/admin`.
+    admin_panel_enabled: bool,
+    /// Bearer token guarding the `/admin/api/*` endpoints (panel + SDK RPCs).
+    admin_token: Option<String>,
+    /// Custom admin RPCs registered via [`Server::admin_rpc`].
+    admin_rpcs: Vec<(String, crate::admin_rpc::RpcFn)>,
+    /// Custom room RPCs registered via [`Server::room_rpc`].
+    room_rpcs: Vec<(String, crate::admin_rpc::RoomRpcHandler)>,
     /// Snapshot persistence configuration.
     persistence: Option<PersistenceConfig>,
 }
@@ -67,7 +73,10 @@ impl Server {
             greet: true,
             ws_read_buffer_size: None,
             ws_write_buffer_size: None,
-            admin: None,
+            admin_panel_enabled: false,
+            admin_token: None,
+            admin_rpcs: Vec::new(),
+            room_rpcs: Vec::new(),
             persistence: None,
         }
     }
@@ -103,8 +112,98 @@ impl Server {
     /// ```ignore
     /// Server::new().admin_panel(Some("secret".to_string()))
     /// ```
+    ///
+    /// The same token also guards the admin RPC API (`/admin/api/rpc/*`).
+    /// If you only need the RPC API (no panel UI), use [`Server::admin_token`].
     pub fn admin_panel(mut self, token: Option<String>) -> Self {
-        self.admin = Some(token);
+        self.admin_panel_enabled = true;
+        self.admin_token = token;
+        self
+    }
+
+    /// Enable the admin API (custom RPCs + the `/admin/api/*` endpoints)
+    /// protected by a bearer token, without serving the `/admin` panel UI.
+    ///
+    /// ```ignore
+    /// Server::new().admin_token(Some("backend-secret".to_string()))
+    /// ```
+    pub fn admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token;
+        self
+    }
+
+    /// Register a custom admin RPC, callable from a trusted backend via
+    /// `POST /admin/api/rpc/{name}` with a bearer token.
+    ///
+    /// `T` implements [`AdminRpc`](crate::admin_rpc::AdminRpc): its `Params`
+    /// is deserialized from the JSON request body and its `Response` is
+    /// serialized as the JSON reply.
+    ///
+    /// ```ignore
+    /// use colyseus::{AdminRpc, AdminContext, Result};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Deserialize)]
+    /// struct ResetRoom { room_id: String }
+    ///
+    /// #[derive(Serialize)]
+    /// struct ResetRoomResult { ok: bool }
+    ///
+    /// #[async_trait]
+    /// impl AdminRpc for ResetRoom {
+    ///     type Params = ResetRoom;
+    ///     type Response = ResetRoomResult;
+    ///     async fn call(p: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
+    ///         ctx.dispose_room(&p.room_id);
+    ///         Ok(ResetRoomResult { ok: true })
+    ///     }
+    /// }
+    ///
+    /// server.admin_token(Some("backend-secret".into()))
+    ///       .admin_rpc::<ResetRoom>("resetRoom");
+    /// ```
+    pub fn admin_rpc<T: crate::admin_rpc::AdminRpc>(mut self, name: &str) -> Self {
+        self.admin_rpcs
+            .push((name.to_string(), crate::admin_rpc::rpc_fn::<T>()));
+        self
+    }
+
+    /// Register a room-based admin RPC, callable via
+    /// `POST /admin/api/rooms/{roomId}/rpc/{name}` with a bearer token.
+    ///
+    /// Unlike [`Server::admin_rpc`], the handler runs **on the room actor** with
+    /// typed `&mut R` + `&mut RoomContext` access (sequentially with the room's
+    /// own handlers) and returns its response to the caller.
+    ///
+    /// ```ignore
+    /// use colyseus::{Room, RoomRpc, RoomContext, Result};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Deserialize)]
+    /// #[serde(rename_all = "camelCase")]
+    /// struct GetScore { player: String }
+    ///
+    /// #[derive(Serialize)]
+    /// struct Score { points: i64 }
+    ///
+    /// #[async_trait]
+    /// impl RoomRpc<GameRoom> for GetScore {
+    ///     type Params = GetScore;
+    ///     type Response = Score;
+    ///     async fn call(room: &mut GameRoom, ctx: &mut RoomContext, p: GetScore) -> Result<Score> {
+    ///         Ok(Score { points: ctx.state::<GameState>().map(|s| s.score).unwrap_or(0) })
+    ///     }
+    /// }
+    ///
+    /// server.room_rpc::<GameRoom, GetScore>("getScore");
+    /// ```
+    pub fn room_rpc<R, T>(mut self, name: &str) -> Self
+    where
+        R: crate::room::Room,
+        T: crate::admin_rpc::RoomRpc<R>,
+    {
+        self.room_rpcs
+            .push((name.to_string(), crate::admin_rpc::room_rpc_fn::<R, T>()));
         self
     }
 
@@ -192,11 +291,17 @@ impl Server {
         if let Some(extra) = self.extra_router {
             app = app.merge(extra);
         }
-        if let Some(token) = self.admin {
-            if token.is_none() {
+        if self.admin_panel_enabled || self.admin_token.is_some() || !self.admin_rpcs.is_empty() || !self.room_rpcs.is_empty() {
+            if self.admin_panel_enabled && self.admin_token.is_none() {
                 tracing::warn!("admin panel enabled WITHOUT a token — anyone can access /admin");
             }
-            app = app.merge(crate::admin::router(mm.clone(), token));
+            app = app.merge(crate::admin::router(
+                mm.clone(),
+                self.admin_token,
+                self.admin_panel_enabled,
+                self.admin_rpcs,
+                self.room_rpcs,
+            ));
         }
 
         (app, mm)

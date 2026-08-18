@@ -35,6 +35,7 @@ pub mod snapshot;
 
 mod actor;
 mod admin;
+mod admin_rpc;
 mod client;
 mod command;
 mod diff;
@@ -49,6 +50,7 @@ pub use async_trait::async_trait;
 pub use serde_json;
 
 pub use actor::{ClientInspection, RoomInspection, RoomSender};
+pub use admin_rpc::{AdminContext, AdminRpc, RoomRpc};
 pub use client::{Client, ClientState, SendOptions};
 pub use command::{Command, Dispatchable, Dispatcher};
 pub use driver::{Conditions, LocalDriver, RoomListing, SortOptions};
@@ -59,4 +61,5 @@ pub use protocol::MessageType;
 pub use room::{BoxFuture, BroadcastOptions, Room, RoomContext};
 pub use server::Server;
 pub use snapshot::{FileSnapshotStore, PersistenceConfig, RoomSnapshot, SnapshotStore};
+pub use state::StateEdit;
 pub use utils::Clock;

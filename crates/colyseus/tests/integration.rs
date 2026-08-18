@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use colyseus::serde_json::{json, Value};
-use colyseus::{async_trait, Client, Result, Room, RoomContext, RoomSnapshot, Server};
+use colyseus::{async_trait, AdminContext, AdminRpc, Client, Result, Room, RoomContext, RoomRpc, RoomSnapshot, Server};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -804,4 +804,305 @@ async fn persistence_preserves_reconnection_token_across_restart() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------
+// Admin RPCs
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SumRpc {
+    a: i64,
+    b: i64,
+}
+
+#[derive(Serialize)]
+struct SumRpcResult {
+    sum: i64,
+}
+
+#[async_trait]
+impl AdminRpc for SumRpc {
+    type Params = SumRpc;
+    type Response = SumRpcResult;
+    async fn call(p: Self::Params, _ctx: AdminContext) -> Result<Self::Response> {
+        Ok(SumRpcResult { sum: p.a + p.b })
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateStateRpc {
+    mode: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateStateRpcResult {
+    room_id: String,
+}
+
+#[async_trait]
+impl AdminRpc for CreateStateRpc {
+    type Params = CreateStateRpc;
+    type Response = CreateStateRpcResult;
+    async fn call(p: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
+        let listing = ctx.create_room("state", json!({ "mode": p.mode })).await?;
+        Ok(CreateStateRpcResult {
+            room_id: listing.room_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCountRpc {
+    room_id: String,
+}
+
+#[derive(Serialize)]
+struct ResetCountRpcResult {
+    found: bool,
+}
+
+#[async_trait]
+impl AdminRpc for ResetCountRpc {
+    type Params = ResetCountRpc;
+    type Response = ResetCountRpcResult;
+    async fn call(p: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
+        let found = ctx.command_room::<StateRoom, _>(&p.room_id, |_room, ctx| {
+            Box::pin(async move {
+                if let Some(state) = ctx.state_mut::<Counter>() {
+                    state.count = 0;
+                }
+            })
+        });
+        Ok(ResetCountRpcResult { found })
+    }
+}
+
+// Room-based RPC: runs on the room actor, returns a response.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdjustCountRpc {
+    delta: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CountResult {
+    count: i64,
+}
+
+#[async_trait]
+impl RoomRpc<StateRoom> for AdjustCountRpc {
+    type Params = AdjustCountRpc;
+    type Response = CountResult;
+
+    async fn call(_room: &mut StateRoom, ctx: &mut RoomContext, p: Self::Params) -> Result<CountResult> {
+        let count = {
+            let state = ctx.state_mut::<Counter>().unwrap();
+            state.count += p.delta;
+            state.count
+        };
+        Ok(CountResult { count })
+    }
+}
+
+async fn start_admin_rpc_server() -> (String, tokio::task::JoinHandle<()>) {
+    let mut server = Server::new();
+    server.define("state", || StateRoom);
+    let server = server
+        .admin_token(Some("backend-secret".to_string()))
+        .admin_rpc::<SumRpc>("sum")
+        .admin_rpc::<CreateStateRpc>("createState")
+        .admin_rpc::<ResetCountRpc>("resetCount")
+        .room_rpc::<StateRoom, AdjustCountRpc>("adjustCount");
+    let (app, _mm) = server.build();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn admin_rpc_auth_and_dispatch() {
+    let (base, handle) = start_admin_rpc_server().await;
+
+    // no token → 401
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/sum"))
+        .json(&json!({ "a": 1, "b": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    // wrong token → 401
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/sum"))
+        .bearer_auth("wrong")
+        .json(&json!({ "a": 1, "b": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    // correct token + valid params → 200 { sum: 3 }
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/sum"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "a": 1, "b": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["sum"], 3);
+
+    // invalid params → 400 with a code
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/sum"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "a": "x", "b": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["code"], colyseus::codes::INVALID_PAYLOAD);
+
+    // unknown rpc → 404
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/nope"))
+        .bearer_auth("backend-secret")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn admin_rpc_can_manage_rooms() {
+    let (base, handle) = start_admin_rpc_server().await;
+
+    // create a room via RPC
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/createState"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "mode": "ranked" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert_eq!(status, 200);
+    let room_id = resp.json::<Value>().await.unwrap()["roomId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // reset its count via typed command_room
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/resetCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "roomId": room_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["found"], true);
+
+    // unknown room → found=false (not an error)
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/resetCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "roomId": "nope" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap()["found"], false);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn room_rpc_runs_on_room_actor() {
+    let (base, handle) = start_admin_rpc_server().await;
+
+    // create a room via RPC
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/createState"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "mode": "ranked" }))
+        .send()
+        .await
+        .unwrap();
+    let room_id = resp.json::<Value>().await.unwrap()["roomId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // room RPC mutates typed state on the room actor and returns a response
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/{room_id}/rpc/adjustCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "delta": 5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["count"], 5);
+
+    // second call sees the mutated state (proves it ran on the room actor)
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/{room_id}/rpc/adjustCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "delta": 10 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap()["count"], 15);
+
+    // auth: no token → 401
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/{room_id}/rpc/adjustCount"))
+        .json(&json!({ "delta": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    // unknown room rpc → 404
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/{room_id}/rpc/nope"))
+        .bearer_auth("backend-secret")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // unknown room → 404
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/nope/rpc/adjustCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "delta": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // invalid params → 400
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rooms/{room_id}/rpc/adjustCount"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "delta": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+
+    handle.abort();
 }
