@@ -24,3 +24,5 @@ node_modules/
 # Editor
 .idea/
 .vscode/
+# built SDK output (shipped to npm via "files", not git)
+clients/ts/*/dist/
