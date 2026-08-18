@@ -5,9 +5,6 @@
 import "./src/env.js";
 
 /** @type {import("next").NextConfig} */
-const config = {
-  // the client SDK ships raw TS sources (see clients/ts)
-  transpilePackages: ["colyseus-rs-client"],
-};
+const config = {};
 
 export default config;

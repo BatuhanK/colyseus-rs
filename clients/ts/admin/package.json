@@ -1,0 +1,36 @@
+{
+  "name": "colyseus-rs-admin",
+  "version": "0.1.0",
+  "description": "Admin SDK for colyseus-rs game servers: room queries, inspect/dispose and custom admin RPCs",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BatuhanK/colyseus-rs.git",
+    "directory": "clients/ts/admin"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "colyseus-rs-client": "0.1.0"
+  }
+}

@@ -5,7 +5,7 @@
  * `Server::admin_rpc`) over the token-guarded `/admin/api/*` HTTP API.
  *
  * ```ts
- * import { AdminClient } from "./admin";
+ * import { AdminClient } from "colyseus-rs-admin";
  *
  * const admin = new AdminClient({ baseUrl: "http://localhost:2567", token: "backend-secret" });
  *
@@ -21,26 +21,28 @@
  * await typed.callUntyped("anythingGoes", { x: 1 });      // escape hatch
  * ```
  *
- * No dependencies — uses `fetch` and (for the events stream) `WebSocket`.
+ * Only dependency: `colyseus-rs-client` (shared room-query types/builder);
+ * otherwise uses `fetch` and (for the events stream) `WebSocket`.
  */
 
 import {
+  combineAbortSignals,
   serializeFilter,
+  type CallOptions,
   type RoomFilter,
   type RoomListing,
   type RoomQueryResult,
-} from "./query.ts";
-import { combineAbortSignals, type CallOptions } from "./util.ts";
+} from "colyseus-rs-client";
 
 export {
   RoomQueryBuilder,
+  type CallOptions,
   type RoomFilter,
   type RoomFilterValue,
   type RoomListing,
   type RoomQueryOp,
   type RoomQueryResult,
-} from "./query.ts";
-export { type CallOptions } from "./util.ts";
+} from "colyseus-rs-client";
 
 export interface Overview {
   processId: string;

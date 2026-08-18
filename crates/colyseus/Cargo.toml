@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "A multiplayer game server framework for Rust — rooms, matchmaking, state sync, reconnection. Inspired by Colyseus."
 license = "MIT"
+repository = "https://github.com/BatuhanK/colyseus-rs"
+homepage = "https://github.com/BatuhanK/colyseus-rs"
+readme = "../../README.md"
+keywords = ["game", "multiplayer", "matchmaking", "websocket", "gamedev"]
+categories = ["game-engines", "network-programming", "web-programming::websocket"]
+rust-version = "1.82"
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 async-trait = "0.1"

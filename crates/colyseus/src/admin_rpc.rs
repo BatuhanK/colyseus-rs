@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::actor::{RoomEvent, RoomHandle, RoomInspection};
-use crate::driver::{RoomListing, RoomQuery, RoomQueryResult};
+use crate::driver::{RoomListing, RoomQuery};
 use crate::error::{close_codes, codes, Result, ServerError};
 use crate::matchmaker::{CreateRoomOutcome, MatchMaker, MatchmakerEvent};
 use crate::presence::Presence;

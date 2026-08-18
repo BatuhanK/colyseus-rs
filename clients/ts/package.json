@@ -1,22 +1,18 @@
 {
-  "name": "colyseus-rs-client",
-  "version": "0.1.0",
-  "description": "Minimal TypeScript client for colyseus-rs servers",
+  "name": "colyseus-rs-ts",
+  "private": true,
   "type": "module",
-  "main": "src/index.ts",
-  "exports": {
-    ".": "./src/index.ts",
-    "./client": "./src/client.ts",
-    "./admin": "./src/admin.ts"
-  },
+  "workspaces": [
+    "client",
+    "admin"
+  ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "node --test \"test/**/*.test.ts\""
-  },
-  "dependencies": {
-    "@msgpack/msgpack": "^3.0.0"
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run build && npm run typecheck --workspaces",
+    "test": "npm run build && npm run test --workspaces"
   },
   "devDependencies": {
+    "tsup": "^8.4.0",
     "typescript": "^5.8.2"
   }
 }
