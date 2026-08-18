@@ -461,7 +461,7 @@ async fn filter_by_routes_to_matching_rooms() {
     assert_eq!(r1["room"]["roomId"], r3["room"]["roomId"]);
 
     // listings visible via the HTTP API, filter field flattened in
-    let rooms: Vec<Value> = reqwest::Client::new()
+    let rooms: Value = reqwest::Client::new()
         .get(format!("{}/rooms/chat", server.base))
         .send()
         .await
@@ -469,8 +469,31 @@ async fn filter_by_routes_to_matching_rooms() {
         .json()
         .await
         .unwrap();
-    assert_eq!(rooms.len(), 2);
-    assert!(rooms.iter().any(|r| r["mode"] == "ranked"));
+    assert_eq!(rooms["total"], 2);
+    let items = rooms["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|r| r["mode"] == "ranked"));
+
+    // ...and the same rooms via the filtered admin query
+    let admin: Value = reqwest::Client::new()
+        .get(format!("{}/admin/api/rooms?name=chat&mode.in=ranked,casual", server.base))
+        .header("authorization", "Bearer backend-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin["total"], 2);
+
+    // unknown filter fields are rejected by the whitelist
+    let bad = reqwest::Client::new()
+        .get(format!("{}/admin/api/rooms?name=chat&nope=1", server.base))
+        .header("authorization", "Bearer backend-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 521);
 }
 
 #[tokio::test]

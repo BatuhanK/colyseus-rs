@@ -5,7 +5,9 @@
 //!   `joinOrCreate`, `create`, `join`, `joinById`, `reconnect`
 //!   (`joinById`/`reconnect` take a room id in place of the room name).
 //!   Body: JSON client options. Response: a seat reservation.
-//! - `GET /rooms` / `GET /rooms/{roomName}` — room listing queries.
+//! - `GET /rooms` / `GET /rooms/{roomName}` — room listing queries, with
+//!   optional filters (`clients=1`, `clients.gte=1`, any `filter_by` field),
+//!   sorting (`sort=createdAt:desc`) and pagination (`limit`/`offset`).
 //!
 //! WebSocket:
 //! - `GET /ws/{roomId}?sessionId=...&reconnectionToken=...` — binary msgpack
@@ -27,6 +29,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::actor::{RoomEvent, RoomHandle};
 use crate::client::{Client, Outbound};
+use crate::driver::RoomQuery;
 use crate::error::{close_codes, codes, Result, ServerError};
 use crate::matchmaker::{AuthContext, MatchMaker, RegisteredHandler};
 use crate::presence::Presence;
@@ -437,15 +440,42 @@ fn error_response(e: ServerError) -> Response {
     (status, Json(json!({ "code": e.code, "error": e.message }))).into_response()
 }
 
-async fn list_rooms(State(state): State<AppState>) -> Response {
-    Json(state.mm.query(None, Default::default())).into_response()
+async fn list_rooms(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match RoomQuery::from_params(&params) {
+        Ok(query) => match state.mm.query_rooms(None, cap_limit(query, 200)) {
+            Ok(result) => Json(result).into_response(),
+            Err(e) => error_response(e),
+        },
+        Err(message) => bad_request(message),
+    }
 }
 
 async fn list_rooms_by_name(
     State(state): State<AppState>,
     Path(room_name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    Json(state.mm.query(Some(&room_name), Default::default())).into_response()
+    match RoomQuery::from_params(&params) {
+        Ok(query) => match state.mm.query_rooms(Some(&room_name), cap_limit(query, 200)) {
+            Ok(result) => Json(result).into_response(),
+            Err(e) => error_response(e),
+        },
+        Err(message) => bad_request(message),
+    }
+}
+
+/// Clamp the public listing's page size so a single query can't dump the
+/// whole room table.
+fn cap_limit(mut query: RoomQuery, max: usize) -> RoomQuery {
+    query.limit = Some(query.limit.unwrap_or(max).min(max));
+    query
+}
+
+fn bad_request(message: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "code": 400, "error": message }))).into_response()
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {

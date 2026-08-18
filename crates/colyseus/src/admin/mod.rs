@@ -12,7 +12,9 @@
 //!
 //! | endpoint | what it does |
 //! | --- | --- |
-//! | `GET /admin/api/overview` | process stats + room listings |
+//! | `GET /admin/api/overview` | process stats (room/connection counts) |
+//! | `GET /admin/api/rooms` `{filters, sort, limit, offset}` | query rooms (operators, pagination) |
+//! | `GET /admin/api/rooms/stats` | per-room-type open/waiting/full counts |
 //! | `GET /admin/api/rooms/{id}` | inspect a room (state, clients, seats) |
 //! | `POST /admin/api/rooms/{id}/lock` / `unlock` | toggle matchmaking lock |
 //! | `POST /admin/api/rooms/{id}/kick` `{sessionId}` | force-disconnect a client |
@@ -24,7 +26,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,7 +38,7 @@ use tokio::sync::oneshot;
 
 use crate::actor::{RoomEvent, RoomInspection};
 use crate::admin_rpc::{AdminContext, RoomRpcHandler, RpcFn};
-use crate::driver::RoomListing;
+use crate::driver::{RoomListing, RoomQuery};
 use crate::error::{close_codes, codes, ServerError};
 use crate::matchmaker::MatchMaker;
 use crate::protocol::MessageType;
@@ -82,6 +84,8 @@ pub(crate) fn router(
     Router::new()
         .route("/admin", get(panel))
         .route("/admin/api/overview", get(overview))
+        .route("/admin/api/rooms", get(list_rooms_query))
+        .route("/admin/api/rooms/stats", get(room_stats))
         .route("/admin/api/rooms/{room_id}", get(inspect_room))
         .route("/admin/api/rooms/{room_id}/lock", post(lock_room))
         .route("/admin/api/rooms/{room_id}/unlock", post(unlock_room))
@@ -142,9 +146,55 @@ async fn overview(State(state): State<AdminState>, headers: HeaderMap) -> Respon
         "rssBytes": rss_bytes,
         "rooms": listings.len(),
         "connections": connections,
-        "listings": listings,
     }))
     .into_response()
+}
+
+/// Filtered, paged room listing — the SDK endpoint behind `AdminClient.listRooms`.
+/// Filters/sorts are validated against the room type's `filter_by` whitelist.
+async fn list_rooms_query(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let auth = authorize(&state, &headers);
+    if auth.status() != StatusCode::OK {
+        return auth;
+    }
+    match RoomQuery::from_params(&params) {
+        Ok(query) => {
+            let query = cap_limit(query, 1000);
+            match state.mm.query_rooms(None, query) {
+                Ok(result) => Json(result).into_response(),
+                Err(e) => (StatusCode::from_u16(e.code).unwrap_or(StatusCode::BAD_REQUEST),
+                    Json(json!({ "code": e.code, "error": e.message })))
+                    .into_response(),
+            }
+        }
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": 400, "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// Per-room-type status counts (open / waiting / full / locked / private).
+async fn room_stats(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let auth = authorize(&state, &headers);
+    if auth.status() != StatusCode::OK {
+        return auth;
+    }
+    Json(state.mm.room_stats(params.get("name").map(String::as_str))).into_response()
+}
+
+fn cap_limit(mut query: RoomQuery, max: usize) -> RoomQuery {
+    query.limit = Some(query.limit.unwrap_or(max).min(max));
+    query
 }
 
 #[derive(serde::Serialize)]

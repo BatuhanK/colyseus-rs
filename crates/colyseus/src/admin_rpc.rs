@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::actor::{RoomEvent, RoomHandle, RoomInspection};
-use crate::driver::RoomListing;
+use crate::driver::{RoomListing, RoomQuery, RoomQueryResult};
 use crate::error::{close_codes, codes, Result, ServerError};
 use crate::matchmaker::{MatchMaker, MatchmakerEvent};
 use crate::presence::Presence;
@@ -51,6 +51,17 @@ impl AdminContext {
     /// List rooms, optionally filtered by room type name.
     pub fn list_rooms(&self, name: Option<&str>) -> Vec<RoomListing> {
         self.mm.query(name, Default::default())
+    }
+
+    /// Run a parameterized [`RoomQuery`] (operators, sort, pagination) — the
+    /// SDK counterpart of `GET /admin/api/rooms`.
+    pub fn query_rooms(&self, query: RoomQuery) -> Result<crate::driver::RoomQueryResult> {
+        self.mm.query_rooms(None, query)
+    }
+
+    /// Per-room-type status counts (open / waiting / full / locked …).
+    pub fn room_stats(&self, name: Option<&str>) -> crate::matchmaker::RoomStats {
+        self.mm.room_stats(name)
     }
 
     /// A single room's public listing, by id.

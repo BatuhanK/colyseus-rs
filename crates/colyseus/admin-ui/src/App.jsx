@@ -22,10 +22,12 @@ export default function App() {
       const o = await api(token, "/overview");
       setStats(o);
       setNeedsAuth(false);
-      const listingsRaw = JSON.stringify(o.listings);
+      // listings moved to the paged query endpoint
+      const r = await api(token, "/rooms?sort=createdAt:desc&limit=500");
+      const listingsRaw = JSON.stringify(r.items);
       if (listingsRaw !== lastListingsRaw.current) {
         lastListingsRaw.current = listingsRaw;
-        setListings(o.listings);
+        setListings(r.items);
       }
     } catch (e) {
       if (e instanceof AuthError) setNeedsAuth(true);

@@ -346,9 +346,27 @@ source: `crates/colyseus/admin-ui`, regenerate with `npm run build` there):
   broadcast, dispose the room, edit state values in the JSON tree
 
 The JSON API (`/admin/api/*`, bearer-token guarded when set):
-`GET overview` · `GET rooms/{id}` · `POST rooms/{id}/lock|unlock|kick|message|dispose|state`.
+`GET overview` · `GET rooms` (filtered, paged — see below) · `GET rooms/stats` ·
+`GET rooms/{id}` · `POST rooms/{id}/lock|unlock|kick|message|dispose|state`.
 State edits are validated by a serialize→edit→deserialize round-trip, so type
 mismatches (e.g. a string into an `i64` field) are rejected server-side.
+
+**Filtered room queries.** `GET /admin/api/rooms` (and the public
+`GET /rooms/{name}`) accept operator filters, sorting and pagination:
+
+```text
+name=tictactoe&clients=1            equality (waiting rooms)
+clients.gte=1&clients.lt=4          ranges (gt/gte/lt/lte)
+slug=abc123&mode.in=ranked,casual   any filter_by field; in
+locked.exists=false                 presence (exists/notExists)
+sort=createdAt:desc,clients:asc     whitelisted sort keys
+limit=25&offset=0&count=true        paging; count=true returns only `total`
+```
+
+Responses are `{ items, total, limit, offset, nextOffset }`. Filter/sort fields
+are validated against the room type's `filter_by` whitelist (plus core fields
+and `metadata.*`); unknown fields → `521`, and `roomId` is always rejected
+(it collides with the engine's generated id in the flattened listing).
 
 ### Admin SDK + custom RPCs (for your own backend)
 

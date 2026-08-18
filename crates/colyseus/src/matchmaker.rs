@@ -13,7 +13,9 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
 use crate::actor::{spawn_restored_room, spawn_room, RoomEvent, RoomHandle};
-use crate::driver::{Conditions, LocalDriver, RoomListing, SortOptions};
+use crate::driver::{
+    Conditions, LocalDriver, RoomListing, RoomQuery, RoomQueryResult, SortOptions,
+};
 use crate::error::{codes, Result, ServerError};
 use crate::presence::{LocalPresence, Presence};
 use crate::room::{Room, RoomContext};
@@ -154,6 +156,22 @@ impl RegisteredHandler {
             (_, opts) => opts,
         }
     }
+}
+
+/// Cheap per-room-type status counts (see [`MatchMaker::room_stats`]).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomStats {
+    /// Rooms of the type (or all rooms when no name filter).
+    pub total: usize,
+    /// Not locked and not at capacity.
+    pub open: usize,
+    /// Open with at least one client — i.e. waiting for an opponent.
+    pub waiting: usize,
+    /// Locked or at capacity.
+    pub full: usize,
+    pub locked: usize,
+    pub private: usize,
 }
 
 /// The result of a successful matchmaking call: a reserved seat.
@@ -432,6 +450,99 @@ impl MatchMaker {
             conditions.insert("name".into(), json!(name));
         }
         self.inner.driver.query(&conditions, None)
+    }
+
+    /// Fields every room type may be filtered/sorted on.
+    pub const CORE_FILTER_FIELDS: &'static [&'static str] = &[
+        "name",
+        "clients",
+        "maxClients",
+        "locked",
+        "private",
+        "createdAt",
+        "processId",
+    ];
+
+    /// Run a parameterized [`RoomQuery`], validating that every filter/sort
+    /// field is allowed: core listing fields, `metadata.*` paths, or the room
+    /// type's own `filter_by` fields. `roomId` is always rejected — it would
+    /// collide with the engine's generated room id in the flattened listing.
+    pub fn query_rooms(
+        &self,
+        room_name: Option<&str>,
+        mut query: RoomQuery,
+    ) -> Result<RoomQueryResult> {
+        if let Some(name) = room_name {
+            query.name = Some(name.to_string());
+        }
+
+        let filter_fields: Vec<String> = match query.name.as_deref() {
+            Some(name) => self
+                .handler(name)
+                .map(|h| h.filter_by.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        let allowed = |field: &str| -> bool {
+            if field == "roomId" {
+                return false;
+            }
+            if Self::CORE_FILTER_FIELDS.contains(&field) || field.starts_with("metadata.") {
+                return true;
+            }
+            filter_fields.iter().any(|f| f == field)
+        };
+
+        for (field, _) in &query.conditions {
+            if !allowed(field) {
+                return Err(ServerError::new(
+                    codes::MATCHMAKE_INVALID_CRITERIA,
+                    format!("unknown filter field \"{field}\""),
+                ));
+            }
+        }
+        for (field, _) in &query.sort {
+            if !allowed(field) {
+                return Err(ServerError::new(
+                    codes::MATCHMAKE_INVALID_CRITERIA,
+                    format!("unknown sort field \"{field}\""),
+                ));
+            }
+        }
+
+        Ok(self.inner.driver.query_rooms(&query))
+    }
+
+    /// Cheap per-room-type status counts (open / waiting / full / locked …).
+    pub fn room_stats(&self, room_name: Option<&str>) -> RoomStats {
+        let mut stats = RoomStats::default();
+        for listing in self.inner.driver.all() {
+            if let Some(name) = room_name {
+                if listing.name != name {
+                    continue;
+                }
+            }
+            stats.total += 1;
+            if listing.is_private {
+                stats.private += 1;
+            }
+            if listing.locked {
+                stats.locked += 1;
+            }
+            let at_capacity = listing
+                .max_clients
+                .is_some_and(|max| listing.clients >= max);
+            if listing.locked || at_capacity {
+                stats.full += 1;
+            } else {
+                stats.open += 1;
+                if listing.clients >= 1 {
+                    stats.waiting += 1;
+                }
+            }
+        }
+        stats
     }
 
     /// Gracefully shut down: dispose all rooms and stop matchmaking.

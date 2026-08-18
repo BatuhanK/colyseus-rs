@@ -39,7 +39,55 @@ export interface Overview {
   rssBytes: number;
   rooms: number;
   connections: number;
-  listings: RoomListing[];
+}
+
+/** A single filter value in a [`RoomQuery`] — primitives or operator objects. */
+export type RoomFilterValue =
+  | string
+  | number
+  | boolean
+  | {
+      eq?: string | number | boolean;
+      ne?: string | number | boolean;
+      gt?: number;
+      gte?: number;
+      lt?: number;
+      lte?: number;
+      in?: (string | number)[];
+      exists?: boolean;
+    };
+
+/** Filtered, paged room query (server-side; GET /admin/api/rooms). */
+export interface RoomQuery {
+  /** Room type name. */
+  name?: string;
+  /** Field filters: `{ slug: "abc", clients: { gte: 1 } }`. */
+  filter?: Record<string, RoomFilterValue>;
+  /** Sort keys, e.g. `"createdAt:desc"` or `["createdAt:desc", "clients:asc"]`. */
+  sort?: string | string[];
+  limit?: number;
+  offset?: number;
+  /** Only compute `total` (items are empty). */
+  count?: boolean;
+}
+
+/** A page of room listings. */
+export interface RoomQueryResult {
+  items: RoomListing[];
+  total: number;
+  limit: number | null;
+  offset: number;
+  nextOffset: number | null;
+}
+
+/** Per-room-type status counts (GET /admin/api/rooms/stats). */
+export interface RoomStats {
+  total: number;
+  open: number;
+  waiting: number;
+  full: number;
+  locked: number;
+  private: number;
 }
 
 export interface ClientInspection {
@@ -81,15 +129,18 @@ export class AdminError extends Error {
 export class AdminClient {
   private baseUrl: string;
   private token?: string;
+  private timeoutMs: number;
 
   /**
-   * @param baseUrl http(s) base url of the game server
-   * @param token   the admin bearer token (set with `Server::admin_token` /
-   *                `Server::admin_panel` on the server)
+   * @param baseUrl   http(s) base url of the game server
+   * @param token     the admin bearer token (set with `Server::admin_token` /
+   *                  `Server::admin_panel` on the server)
+   * @param timeoutMs default fetch timeout (aborts slow calls; default 10s)
    */
-  constructor(baseUrl: string, token?: string) {
+  constructor(baseUrl: string, token?: string, timeoutMs = 10_000) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.token = token;
+    this.timeoutMs = timeoutMs;
   }
 
   setToken(token: string) {
@@ -105,10 +156,48 @@ export class AdminClient {
     return this.request("/admin/api/overview");
   }
 
-  /** List rooms, optionally filtered by room type name. */
-  async listRooms(name?: string): Promise<RoomListing[]> {
-    const overview = await this.overview();
-    return name ? overview.listings.filter((l) => l.name === name) : overview.listings;
+  // ------------------------------------------------------------------
+  // Filtered room queries
+  // ------------------------------------------------------------------
+
+  /**
+   * Query rooms server-side with filters, sorting and pagination
+   * (GET /admin/api/rooms).
+   *
+   * ```ts
+   * const page = await admin.listRooms({
+   *   name: "tictactoe",
+   *   filter: { clients: 1 },          // waiting for an opponent
+   *   sort: "createdAt:desc",
+   *   limit: 25,
+   * });
+   * ```
+   */
+  async listRooms(query?: RoomQuery): Promise<RoomQueryResult> {
+    return this.request(`/admin/api/rooms${buildQueryString(query)}`);
+  }
+
+  /** All rooms of a type (auto-paginated) — for dashboards / panels. */
+  async listRoomsAll(name?: string): Promise<RoomListing[]> {
+    const out: RoomListing[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = await this.listRooms({ name, limit: 500, offset });
+      out.push(...page.items);
+      if (page.nextOffset === null) return out;
+      offset = page.nextOffset;
+    }
+  }
+
+  /** Per-room-type status counts (open / waiting / full / locked …). */
+  async roomStats(name?: string): Promise<RoomStats> {
+    return this.request(`/admin/api/rooms/stats${name ? `?name=${encodeURIComponent(name)}` : ""}`);
+  }
+
+  /** First open room with exactly one client — i.e. waiting for an opponent. */
+  async findWaitingRoom(name: string): Promise<RoomListing | undefined> {
+    const page = await this.listRooms({ name, filter: { clients: 1 }, limit: 1 });
+    return page.items[0];
   }
 
   /** Inspect a room: full state, clients, seats, reconnections. */
@@ -235,18 +324,58 @@ export class AdminClient {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
 
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: opts.method ?? "GET",
-      headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await fetch(`${this.baseUrl}${path}`, {
+        method: opts.method ?? "GET",
+        headers,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        signal: controller.signal,
+      });
 
-    if (res.status === 401) throw new AdminError("unauthorized", 401);
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({ error: res.statusText }));
-      throw new AdminError(body.error ?? res.statusText, body.code ?? res.status);
+      if (res.status === 401) throw new AdminError("unauthorized", 401);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string; code?: number };
+        throw new AdminError(body.error ?? res.statusText, body.code ?? res.status);
+      }
+      if (res.status === 204) return null;
+      return res.json();
+    } finally {
+      clearTimeout(timer);
     }
-    if (res.status === 204) return null;
-    return res.json();
   }
+}
+
+/** Serialize a [`RoomQuery`] into URL query params. */
+function buildQueryString(query?: RoomQuery): string {
+  if (!query) return "";
+  const params = new URLSearchParams();
+  if (query.name) params.set("name", query.name);
+  if (query.filter) {
+    for (const [field, value] of Object.entries(query.filter)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === "object") {
+        for (const [op, v] of Object.entries(value)) {
+          if (v === undefined) continue;
+          if (op === "in") params.set(`${field}.in`, Array.isArray(v) ? v.join(",") : String(v));
+          else params.set(`${field}.${op}`, String(v));
+        }
+      } else {
+        params.set(field, String(value));
+      }
+    }
+  }
+  if (query.sort) {
+    const parts = Array.isArray(query.sort) ? query.sort : [query.sort];
+    params.set(
+      "sort",
+      parts.map((s) => (s.includes(":") ? s : `${s}:asc`)).join(","),
+    );
+  }
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.offset !== undefined) params.set("offset", String(query.offset));
+  if (query.count) params.set("count", "true");
+  const s = params.toString();
+  return s ? `?${s}` : "";
 }
