@@ -155,6 +155,11 @@ impl RegisteredHandler {
     /// creating a duplicate. Retried or double-submitted creations thus stay
     /// idempotent. Unique fields are also exposed on the room listing (like
     /// `filter_by` fields) so the engine can look them up.
+    ///
+    /// The dedupe only applies when **every** unique field is present in the
+    /// options; a creation that omits any of them always spawns a fresh room,
+    /// so key-less matchmaking requests can't collapse into one shared room
+    /// (which would silently ignore the caller's match filter).
     pub fn unique_by(&mut self, fields: &[&str]) -> &mut Self {
         self.unique_by = fields.iter().map(|s| s.to_string()).collect();
         self
@@ -215,17 +220,14 @@ impl RegisteredHandler {
         conditions
     }
 
-    /// The uniqueness lookup: room type name + every `unique_by` field
-    /// (fields missing from the options match rooms also missing them).
+    /// The uniqueness lookup: room type name + every `unique_by` field.
+    /// Callers must guarantee all `unique_by` fields are present in the
+    /// options (see `create_room_inner`).
     fn unique_conditions(&self, options: &Value) -> Vec<(String, Condition)> {
         let mut conditions = vec![("name".into(), Condition::eq(json!(self.name)))];
         for field in &self.unique_by {
-            match options.get(field) {
-                Some(v) => conditions.push((field.clone(), Condition::eq(v.clone()))),
-                None => conditions.push((
-                    field.clone(),
-                    Condition { op: Op::NotExists, value: None },
-                )),
+            if let Some(v) = options.get(field) {
+                conditions.push((field.clone(), Condition::eq(v.clone())));
             }
         }
         conditions
@@ -479,10 +481,28 @@ impl MatchMaker {
                         // re-check: another request may have created the room meanwhile
                         match self.find_match(&handler, &conditions, filter, &options) {
                             Some(l) => Ok(l),
-                            None => self
-                                .create_room_inner(room_name, handler.merged_options(options.clone()))
-                                .await
-                                .map(|outcome| outcome.listing),
+                            None => {
+                                let outcome = self
+                                    .create_room_inner(
+                                        room_name,
+                                        handler.merged_options(options.clone()),
+                                    )
+                                    .await?;
+                                // A unique_by-reused room never passed through
+                                // find_match — verify it against the criteria so
+                                // the filter contract isn't silently broken. A
+                                // mismatch is retryable: the room may dispose or
+                                // drain before the next attempt.
+                                if !outcome.created
+                                    && self
+                                        .find_match(&handler, &conditions, filter, &options)
+                                        .is_none_or(|l| l.room_id != outcome.listing.room_id)
+                                {
+                                    Err(ServerError::seat_expired())
+                                } else {
+                                    Ok(outcome.listing)
+                                }
+                            }
                         }
                     };
                     self.release_create_lock(&lock_key, &lock);
@@ -946,8 +966,13 @@ impl MatchMaker {
     async fn create_room_inner(&self, room_name: &str, options: Value) -> Result<CreateRoomOutcome> {
         let handler = self.handler(room_name)?;
 
-        // unique_by: dedupe duplicate/concurrent creations on the unique key
-        if !handler.unique_by.is_empty() {
+        // unique_by: dedupe duplicate/concurrent creations on the unique key.
+        // Only applies when every unique field is present in the options —
+        // otherwise all key-less creations would collapse into a single
+        // room, silently ignoring the caller's match filter.
+        if !handler.unique_by.is_empty()
+            && handler.unique_by.iter().all(|f| options.get(f).is_some())
+        {
             let key_conditions = handler.unique_conditions(&options);
             let lock_key = format!("{room_name}:unique:{}", conditions_key(&key_conditions));
             let lock = self.create_lock(&lock_key);
@@ -1288,6 +1313,19 @@ mod tests {
         let other = mm.create_room("game", json!({ "slug": "xyz" })).await.unwrap();
         assert!(other.created);
         assert!(mm.inner.create_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unique_by_ignores_creations_missing_the_unique_fields() {
+        // key-less creations (e.g. quick-match with no `slug`) must not
+        // collapse into one shared room — that would bypass the match filter
+        let mm = mm_with(|h| {
+            h.unique_by(&["slug"]);
+        });
+        let first = mm.create_room("game", json!({})).await.unwrap();
+        let second = mm.create_room("game", json!({})).await.unwrap();
+        assert!(first.created && second.created);
+        assert_ne!(first.listing.room_id, second.listing.room_id);
     }
 
     #[tokio::test]
