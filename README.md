@@ -82,6 +82,9 @@ cargo run --example game    # state sync, game loop, reconnection
 | Matchmaking: `joinOrCreate` / `create` / `join` / `joinById` / `reconnect` | ✅ | ✅ |
 | Seat reservations w/ timeout | ✅ | ✅ |
 | `filter_by` / `sort_by` / default options | ✅ | ✅ |
+| Operator matchmaking filters (`clients.lt=2`, …) + custom match hooks | — | ✅ (`filter` in the matchmake body, `match_filter_fn` / `match_sort_fn`) |
+| Strict `filter_by` semantics (no wildcard cross-joins) | — | ✅ (`strict_filter_fields`) |
+| Idempotent room creation | — | ✅ (`unique_by`, `Idempotency-Key` header) |
 | Concurrent-creation lock (same criteria → one room) | ✅ | ✅ |
 | `max_clients`, `lock/unlock`, `set_private`, metadata | ✅ | ✅ |
 | State sync | Schema (custom binary) | any `Serialize` struct → JSON-Patch + msgpack |
@@ -111,11 +114,13 @@ cargo run --example game    # state sync, game loop, reconnection
 ```
 ┌──────────────────────────── Server (axum) ───────────────────────────┐
 │ POST /matchmake/{method}/{roomName} ──► MatchMaker                    │
-│ GET  /rooms[/{name}]                 ──► LocalDriver (listings)       │
+│ GET  /rooms[/{name}]                 ──► Driver (listings)            │
 │ GET  /ws/{roomId}?sessionId=…        ──► Room actor (via mailbox)     │
 └───────────────────────────────────────────────────────────────────────┘
         MatchMaker ── owns ──► RoomHandle { room_id, mpsc::Sender }
-        LocalDriver ── RoomListing { roomId, name, clients, locked, … }
+        Driver     ── RoomListing { roomId, name, clients, locked, … }
+                      (trait; `LocalDriver` in-memory default — the
+                      multi-process seam, like `Presence`)
         Presence    ── pub/sub + key-value (trait; in-memory default)
 
 Each room = one tokio task:
@@ -130,6 +135,39 @@ Each room = one tokio task:
   through the room's mailbox.
 - Client → room messages carry a *connection id*, so stale sockets from before
   a reconnection can't interfere with the new connection.
+
+## Matchmaking semantics
+
+`POST /matchmake/{method}/{roomName}` accepts either a bare options object or
+the extended form `{ "options": {…}, "filter": {…} }` (detected by the
+reserved keys). `filter` uses the same operator model as the room-query API
+(`eq/ne/gt/gte/lt/lte/in/exists`) on core fields, the room type's `filter_by`
+fields and `metadata.*`, and applies to `joinOrCreate` / `join`:
+
+```json
+{ "options": {}, "filter": { "clients": { "lt": 2 } } }
+```
+
+So `joinOrCreate("tictactoe", {}, { clients < 2 })` finds or creates a room
+with a free seat atomically — no find-then-create race. An optional
+`Idempotency-Key` header makes mutating calls safe to retry: the resulting
+seat reservation is cached for 30s and replayed for duplicate requests
+(scoped per `{method, roomName, key}`).
+
+Room-type knobs (chained onto `Server::define`):
+
+| knob | meaning |
+| --- | --- |
+| `filter_by(&["mode"])` | option fields rooms are matched/listed by |
+| `sort_by(&[("clients", 1)])` | candidate ordering at match time |
+| `unique_by(&["slug"])` | `create_room` reuses a live room with the same key (`CreateRoomOutcome.created == false`) instead of duplicating |
+| `strict_filter_fields(true)` | a request missing a `filter_by` field only matches rooms also missing it (default `false` = Colyseus wildcard semantics) |
+| `match_filter_fn(f)` / `match_sort_fn(f)` | custom predicate / comparator run at match time |
+| `internal()` / `persistent(false)` | server-side-only creation / opt out of snapshots |
+
+Server-side bootstrap (create global rooms, subscribe to lobby events) hooks
+into `Server::listen` via `Server::on_start(|mm| async { … })` — it runs after
+snapshot restore, before any connection is accepted.
 
 ## Wire protocol (for mobile / custom clients)
 
@@ -346,8 +384,14 @@ source: `crates/colyseus/admin-ui`, regenerate with `npm run build` there):
   broadcast, dispose the room, edit state values in the JSON tree
 
 The JSON API (`/admin/api/*`, bearer-token guarded when set):
-`GET overview` · `GET rooms` (filtered, paged — see below) · `GET rooms/stats` ·
-`GET rooms/{id}` · `POST rooms/{id}/lock|unlock|kick|message|dispose|state`.
+`GET overview` · `GET schema` (capability catalog: registered room types with
+their matchmaking knobs, admin RPC names + Rust type names, core filterable
+listing fields — SDKs can discover instead of hardcoding) · `GET rooms`
+(filtered, paged — see below) · `GET rooms/stats` · `GET rooms/{id}` ·
+`POST rooms/{id}/lock|unlock|kick|message|dispose|state` ·
+`GET rooms/{id}/events` (WebSocket traffic stream; token via
+`Sec-WebSocket-Protocol: bearer.<token>`, echoed back on success — the
+`?token=` query param remains as a deprecated fallback).
 State edits are validated by a serialize→edit→deserialize round-trip, so type
 mismatches (e.g. a string into an `i64` field) are rejected server-side.
 
@@ -406,12 +450,17 @@ Each RPC is `POST /admin/api/rpc/{name}` with a `Bearer` token. `Params` is
 deserialized from the JSON body; `Response` is serialized as the JSON reply.
 Errors return `{ code, error }` with an HTTP status (invalid params → `400`).
 
+Send an `Idempotency-Key: <key>` header to make a call retriable: a successful
+response is cached for ~30s and replayed for duplicate keys (errors are never
+cached). Handlers must be side-effect-safe under replay within that window —
+a retried call returns the original response without re-running the handler.
+
 `AdminContext` is the safe handle handed to every RPC:
 
 | method | purpose |
 | --- | --- |
 | `list_rooms(name?)` / `room(id)` | query listings |
-| `create_room(name, options)` | server-side room creation |
+| `create_room(name, options)` | server-side room creation (returns `CreateRoomOutcome`; reuses a live room when `unique_by` matches) |
 | `inspect_room(id)` | state + clients + seats |
 | `dispose_room(id)` / `lock_room(id)` / `unlock_room(id)` | lifecycle |
 | `kick(id, session_id)` | force-disconnect |
@@ -468,15 +517,23 @@ TypeScript side ([`clients/ts/src/admin.ts`](clients/ts/src/admin.ts), no deps):
 ```ts
 import { AdminClient } from "colyseus-rs-client/admin";
 
-const admin = new AdminClient("http://localhost:2567", "backend-secret");
+const admin = new AdminClient({
+  baseUrl: "http://localhost:2567",
+  token: "backend-secret",
+});
 
 await admin.listRooms();
 await admin.kick(roomId, sessionId);
 await admin.sendMessage(roomId, "system", { text: "hi" });
 await admin.setStatePath(roomId, "/players/1/score", 100);
 
-// custom RPCs
-const { ok } = await admin.call<{ ok: boolean }>("resetRoom", { roomId });
+// custom RPCs, compile-time checked against a declared catalog
+interface MyRpcs {
+  resetRoom: { params: { roomId: string }; response: { ok: boolean } };
+}
+const typed = new AdminClient<MyRpcs>({ baseUrl: "http://localhost:2567", token: "backend-secret" });
+const { ok } = await typed.call("resetRoom", { roomId });
+await typed.callUntyped("notInTheCatalog", { anything: 1 }); // escape hatch
 
 // room-based RPCs (run on the room actor)
 const score = await admin.callRoom<{ points: number }>(roomId, "adjustScore", {
@@ -484,7 +541,10 @@ const score = await admin.callRoom<{ points: number }>(roomId, "adjustScore", {
   delta: 10,
 });
 
-// live traffic stream
+// capability discovery (room types, RPCs, filterable fields)
+const schema = await admin.schema();
+
+// live traffic stream (token travels in the WS subprotocol, not the URL)
 const close = admin.roomEvents(roomId, (e) => console.log(e.kind));
 ```
 
@@ -548,7 +608,7 @@ and the usual `ulimit -n` / `somaxconn` for >1k connections.
 
 ## TypeScript client
 
-[`clients/ts`](clients/ts) contains a ~250-line client
+[`clients/ts`](clients/ts) contains a small client
 (`npm i @msgpack/msgpack` is its only dependency):
 
 ```ts
@@ -562,6 +622,25 @@ room.onLeave(async () => {
 });
 ```
 
+Matchmaking calls accept per-call options — a server-side room `filter`
+(`joinOrCreate` / `join`), a `timeout`, an abort `signal`, and an
+`idempotencyKey` (auto-generated UUID by default; the server replays the same
+seat reservation for a duplicate key within 30s, so retried/double-submitted
+joins can't create ghost rooms):
+
+```ts
+const room = await client.joinOrCreate("tictactoe", {}, {
+  filter: { clients: { lt: 2 } },   // only rooms with a free seat
+  timeout: 5_000,
+});
+
+// server-side listing queries (GET /rooms) via the query builder
+const page = await client.rooms((q) =>
+  q.name("trivia").where("clients", "lt", 4).sort("createdAt", "desc").limit(20),
+);
+// → RoomQueryResult { items, total, limit, offset, nextOffset }
+```
+
 For mobile (Swift/Kotlin/Unity): implement the ~6 frame types above with any
 msgpack library plus a JSON-Patch library (or a tiny applier — see
 `clients/ts/src/client.ts`).
@@ -570,6 +649,9 @@ msgpack library plus a JSON-Patch library (or a tiny applier — see
 
 - **Presence**: implement the `Presence` trait (pub/sub + KV) on top of Redis
   to share data across processes; pass it via `Server::presence(...)`.
+- **Driver**: implement the `Driver` trait (room listings + matchmaking
+  queries) on top of Redis/SQL for multi-process deployments; pass it via
+  `Server::driver(...)`. Default: in-memory `LocalDriver`.
 - **Custom HTTP routes**: `Server::routes(router)` merges your axum router.
 - **Lobby**: subscribe to `MatchMaker::subscribe()` for
   `RoomCreated/RoomUpdated/RoomRemoved` events and push them to a room of

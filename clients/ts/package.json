@@ -9,7 +9,14 @@
     "./client": "./src/client.ts",
     "./admin": "./src/admin.ts"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
   }
 }

@@ -7,14 +7,18 @@
 
 import { AdminClient } from "../src/admin.ts";
 
-const admin = new AdminClient("http://localhost:2567", "backend-secret");
+const admin = new AdminClient({ baseUrl: "http://localhost:2567", token: "backend-secret" });
 
 // filtered room query: empty before we create anything
 const page = await admin.listRooms({ name: "game", sort: "createdAt:desc", limit: 10 });
 console.log("rooms before:", page.total, JSON.stringify(page));
 
+// capability discovery
+const schema = await admin.schema();
+console.log("schema:", schema.roomTypes.map((t) => t.name).join(", "), "| rpcs:", schema.adminRpcs.map((r) => r.name).join(", "));
+
 // custom RPC: create a room
-const created = await admin.call("createGame", { mode: "ranked" });
+const created = await admin.callUntyped("createGame", { mode: "ranked" });
 console.log("created room:", created.roomId);
 
 // filtered query now sees it; operators work (clients=0)
@@ -27,14 +31,14 @@ console.log("first empty room:", viaId.items[0]?.roomId);
 console.log("stats:", JSON.stringify(await admin.roomStats("game")));
 
 // findWaitingRoom helper (no waiting room while clients=0)
-console.log("findWaitingRoom:", (await admin.findWaitingRoom("game")) ?? "none");
+console.log("findWaitingRoom:", (await admin.findWaitingRoom("game", { clients: 1 })) ?? "none");
 
 // custom RPC: broadcast into it
-const shout = await admin.call("shout", { roomId: created.roomId, text: "hello from admin sdk" });
+const shout = await admin.callUntyped("shout", { roomId: created.roomId, text: "hello from admin sdk" });
 console.log("shout delivered:", shout.delivered);
 
 // custom RPC: typed room access (reset score)
-const reset = await admin.call("resetScore", { roomId: created.roomId });
+const reset = await admin.callUntyped("resetScore", { roomId: created.roomId });
 console.log("reset found:", reset.found);
 
 // room-based RPC: runs on the room actor, returns a response

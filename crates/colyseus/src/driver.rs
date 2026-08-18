@@ -1,14 +1,15 @@
 //! Room listings and the matchmaking driver.
 //!
 //! The driver stores [`RoomListing`]s — the public, queryable view of a room —
-//! and answers matchmaking queries. The default implementation is in-memory;
-//! the API is deliberately small so a Redis/SQL-backed driver can be added
-//! without touching the rest of the framework.
+//! and answers matchmaking queries. The [`Driver`] trait is the scale-out
+//! seam: the default [`LocalDriver`] is in-memory; a Redis/SQL-backed driver
+//! can be dropped in via `Server::driver(...)` without touching the rest of
+//! the framework.
 //!
 //! # Query API
 //!
 //! Beyond exact-equality conditions (the classic Colyseus `filter_by` style),
-//! [`LocalDriver::query_rooms`] accepts a [`RoomQuery`] with comparison
+//! [`Driver::query_rooms`] accepts a [`RoomQuery`] with comparison
 //! operators (`gt/gte/lt/lte/ne/in/exists`), sorting, and pagination — the
 //! surface used by `GET /rooms/{name}`, the admin `/admin/api/rooms`
 //! endpoint, and the `AdminClient` SDK.
@@ -46,6 +47,21 @@ impl RoomListing {
     /// Serialize to a flat JSON object used for condition matching and sorting.
     fn to_flat_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// A [`RoomListing`] plus its pre-flattened JSON form, so query filter/sort
+/// doesn't re-serialize every listing per request.
+#[derive(Debug, Clone)]
+struct ListingEntry {
+    listing: RoomListing,
+    flat: Value,
+}
+
+impl ListingEntry {
+    fn new(listing: RoomListing) -> Self {
+        let flat = listing.to_flat_value();
+        ListingEntry { listing, flat }
     }
 }
 
@@ -297,40 +313,166 @@ fn parse_value(raw: &str) -> Value {
     }
 }
 
+/// Parse a JSON matchmaking `filter` object into query conditions — the
+/// operator model of [`RoomQuery`] in JSON form:
+///
+/// ```json
+/// { "clients": { "lt": 2 }, "slug": "abc", "mode": { "in": ["a", "b"] },
+///   "metadata.region": { "exists": true } }
+/// ```
+///
+/// A bare value means equality; an object maps operator names
+/// (`eq/ne/gt/gte/lt/lte/in/exists/notExists`) to expected values.
+pub fn parse_filter(filter: &Value) -> Result<Vec<(String, Condition)>, String> {
+    let Value::Object(map) = filter else {
+        return Err("filter must be a JSON object".to_string());
+    };
+    let mut conditions = Vec::new();
+    for (field, raw) in map {
+        if field.is_empty() {
+            return Err("empty filter field".to_string());
+        }
+        match raw {
+            Value::Object(ops) => {
+                if ops.is_empty() {
+                    return Err(format!("empty operator object for \"{field}\""));
+                }
+                for (op, value) in ops {
+                    let condition = match op.as_str() {
+                        "eq" => Condition { op: Op::Eq, value: Some(value.clone()) },
+                        "ne" => Condition { op: Op::Ne, value: Some(value.clone()) },
+                        "gt" => Condition { op: Op::Gt, value: Some(value.clone()) },
+                        "gte" => Condition { op: Op::Gte, value: Some(value.clone()) },
+                        "lt" => Condition { op: Op::Lt, value: Some(value.clone()) },
+                        "lte" => Condition { op: Op::Lte, value: Some(value.clone()) },
+                        "in" => {
+                            let Value::Array(values) = value else {
+                                return Err(format!("\"in\" expects an array for \"{field}\""));
+                            };
+                            Condition { op: Op::In(values.clone()), value: None }
+                        }
+                        "exists" | "notExists" => {
+                            let expect = value
+                                .as_bool()
+                                .ok_or_else(|| format!("\"exists\" expects a boolean for \"{field}\""))?;
+                            let expect = if op == "notExists" { !expect } else { expect };
+                            Condition {
+                                op: if expect { Op::Exists } else { Op::NotExists },
+                                value: None,
+                            }
+                        }
+                        other => {
+                            return Err(format!("unknown filter operator \"{other}\""));
+                        }
+                    };
+                    conditions.push((field.clone(), condition));
+                }
+            }
+            value => conditions.push((field.clone(), Condition::eq(value.clone()))),
+        }
+    }
+    Ok(conditions)
+}
+
 // ---------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------
 
+/// The room-listing store: the scale-out seam for matchmaking.
+///
+/// The default [`LocalDriver`] keeps everything in memory. Provide your own
+/// implementation (e.g. backed by Redis or SQL) via `Server::driver(...)` to
+/// share listings across processes. All methods are synchronous; an
+/// asynchronous backend is expected to block internally.
+///
+/// ```
+/// use colyseus::driver::{Driver, LocalDriver, RoomListing, RoomQuery, RoomQueryResult};
+///
+/// /// A custom driver that delegates to the in-memory one (a real
+/// /// implementation would talk to an external store instead).
+/// #[derive(Default)]
+/// struct MyDriver {
+///     inner: LocalDriver,
+/// }
+///
+/// impl Driver for MyDriver {
+///     fn get(&self, room_id: &str) -> Option<RoomListing> {
+///         self.inner.get(room_id)
+///     }
+///     fn insert(&self, listing: RoomListing) {
+///         self.inner.insert(listing)
+///     }
+///     fn update_by_id(&self, room_id: &str, f: &mut dyn FnMut(&mut RoomListing)) -> bool {
+///         self.inner.update_by_id(room_id, f)
+///     }
+///     fn remove(&self, room_id: &str) -> bool {
+///         self.inner.remove(room_id)
+///     }
+///     fn all(&self) -> Vec<RoomListing> {
+///         self.inner.all()
+///     }
+///     fn clear(&self) {
+///         self.inner.clear()
+///     }
+///     fn query_rooms(&self, query: &RoomQuery) -> RoomQueryResult {
+///         self.inner.query_rooms(query)
+///     }
+/// }
+/// ```
+pub trait Driver: Send + Sync {
+    /// Fetch a single listing by room id.
+    fn get(&self, room_id: &str) -> Option<RoomListing>;
+    /// Insert (or replace) a listing.
+    fn insert(&self, listing: RoomListing);
+    /// Mutate a listing in place. Returns `false` when the room is unknown.
+    fn update_by_id(&self, room_id: &str, f: &mut dyn FnMut(&mut RoomListing)) -> bool;
+    /// Remove a listing. Returns `false` when the room was unknown.
+    fn remove(&self, room_id: &str) -> bool;
+    /// All listings (no ordering guarantees).
+    fn all(&self) -> Vec<RoomListing>;
+    /// Drop all listings.
+    fn clear(&self);
+    /// Query listings with the full [`RoomQuery`] (operators, sort, pagination).
+    fn query_rooms(&self, query: &RoomQuery) -> RoomQueryResult;
+
+    /// Legacy exact-equality query (kept for compatibility — delegates to
+    /// [`Driver::query_rooms`]).
+    fn query(&self, conditions: &Conditions, sort: Option<&SortOptions>) -> Vec<RoomListing> {
+        let room_query = RoomQuery {
+            name: None,
+            conditions: conditions
+                .iter()
+                .map(|(field, value)| {
+                    (field.clone(), Condition { op: Op::Eq, value: Some(value.clone()) })
+                })
+                .collect(),
+            sort: sort.cloned().unwrap_or_default(),
+            limit: None,
+            offset: 0,
+            count: false,
+        };
+        self.query_rooms(&room_query).items
+    }
+
+    /// The first listing matching `conditions`, ordered by `sort`.
+    fn find_one(
+        &self,
+        conditions: &Conditions,
+        sort: Option<&SortOptions>,
+    ) -> Option<RoomListing> {
+        self.query(conditions, sort).into_iter().next()
+    }
+}
+
 /// In-memory matchmaking driver.
 #[derive(Default)]
 pub struct LocalDriver {
-    listings: DashMap<String, RoomListing>,
+    listings: DashMap<String, ListingEntry>,
 }
 
 impl LocalDriver {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn get(&self, room_id: &str) -> Option<RoomListing> {
-        self.listings.get(room_id).map(|l| l.clone())
-    }
-
-    pub fn insert(&self, listing: RoomListing) {
-        self.listings.insert(listing.room_id.clone(), listing);
-    }
-
-    pub fn update_by_id(&self, room_id: &str, f: impl FnOnce(&mut RoomListing)) -> bool {
-        if let Some(mut l) = self.listings.get_mut(room_id) {
-            f(&mut l);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn remove(&self, room_id: &str) -> bool {
-        self.listings.remove(room_id).is_some()
     }
 
     pub fn len(&self) -> usize {
@@ -340,35 +482,59 @@ impl LocalDriver {
     pub fn is_empty(&self) -> bool {
         self.listings.is_empty()
     }
+}
 
-    pub fn all(&self) -> Vec<RoomListing> {
-        self.listings.iter().map(|l| l.clone()).collect()
+impl Driver for LocalDriver {
+    fn get(&self, room_id: &str) -> Option<RoomListing> {
+        self.listings.get(room_id).map(|e| e.listing.clone())
     }
 
-    pub fn clear(&self) {
+    fn insert(&self, listing: RoomListing) {
+        self.listings
+            .insert(listing.room_id.clone(), ListingEntry::new(listing));
+    }
+
+    fn update_by_id(&self, room_id: &str, f: &mut dyn FnMut(&mut RoomListing)) -> bool {
+        if let Some(mut e) = self.listings.get_mut(room_id) {
+            f(&mut e.listing);
+            e.flat = e.listing.to_flat_value();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove(&self, room_id: &str) -> bool {
+        self.listings.remove(room_id).is_some()
+    }
+
+    fn all(&self) -> Vec<RoomListing> {
+        self.listings.iter().map(|e| e.listing.clone()).collect()
+    }
+
+    fn clear(&self) {
         self.listings.clear();
     }
 
-    /// Query listings with the full [`RoomQuery`] (operators, sort, pagination).
-    pub fn query_rooms(&self, query: &RoomQuery) -> RoomQueryResult {
-        let mut matched: Vec<RoomListing> = self
+    fn query_rooms(&self, query: &RoomQuery) -> RoomQueryResult {
+        let mut matched: Vec<(RoomListing, Value)> = self
             .listings
             .iter()
-            .filter(|l| {
-                let flat = l.to_flat_value();
+            .filter(|e| {
+                let flat = &e.flat;
                 if let Some(name) = &query.name {
                     if flat.get("name").and_then(|v| v.as_str()) != Some(name.as_str()) {
                         return false;
                     }
                 }
                 for (field, condition) in &query.conditions {
-                    if !matches_condition(resolve_path(&flat, field), condition) {
+                    if !matches_condition(resolve_path(flat, field), condition) {
                         return false;
                     }
                 }
                 true
             })
-            .map(|l| l.clone())
+            .map(|e| (e.listing.clone(), e.flat.clone()))
             .collect();
 
         if !query.sort.is_empty() {
@@ -388,7 +554,12 @@ impl LocalDriver {
 
         let offset = query.offset.min(total);
         let limit = query.limit.unwrap_or(usize::MAX);
-        let items: Vec<RoomListing> = matched.into_iter().skip(offset).take(limit).collect();
+        let items: Vec<RoomListing> = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(listing, _)| listing)
+            .collect();
         let next_offset = if offset + items.len() < total {
             Some(offset + items.len())
         } else {
@@ -402,33 +573,6 @@ impl LocalDriver {
             offset,
             next_offset,
         }
-    }
-
-    /// Legacy exact-equality query (kept for compatibility — delegates to
-    /// [`LocalDriver::query_rooms`]).
-    pub fn query(&self, conditions: &Conditions, sort: Option<&SortOptions>) -> Vec<RoomListing> {
-        let room_query = RoomQuery {
-            name: None,
-            conditions: conditions
-                .iter()
-                .map(|(field, value)| {
-                    (field.clone(), Condition { op: Op::Eq, value: Some(value.clone()) })
-                })
-                .collect(),
-            sort: sort.cloned().unwrap_or_default(),
-            limit: None,
-            offset: 0,
-            count: false,
-        };
-        self.query_rooms(&room_query).items
-    }
-
-    pub fn find_one(
-        &self,
-        conditions: &Conditions,
-        sort: Option<&SortOptions>,
-    ) -> Option<RoomListing> {
-        self.query(conditions, sort).into_iter().next()
     }
 }
 
@@ -499,15 +643,12 @@ fn matches_condition(actual: Option<&Value>, condition: &Condition) -> bool {
     }
 }
 
-fn sort_listings(listings: &mut Vec<RoomListing>, sort: &SortOptions) {
-    let flats: Vec<Value> = listings.iter().map(|l| l.to_flat_value()).collect();
-    let mut indexed: Vec<(usize, RoomListing)> =
-        std::mem::take(listings).into_iter().enumerate().collect();
-    indexed.sort_by(|(ia, _), (ib, _)| {
+fn sort_listings(listings: &mut [(RoomListing, Value)], sort: &SortOptions) {
+    listings.sort_by(|(_, fa), (_, fb)| {
         for (field, dir) in sort {
             let ord = value_cmp(
-                resolve_path(&flats[*ia], field).unwrap_or(&Value::Null),
-                resolve_path(&flats[*ib], field).unwrap_or(&Value::Null),
+                resolve_path(fa, field).unwrap_or(&Value::Null),
+                resolve_path(fb, field).unwrap_or(&Value::Null),
             )
             .unwrap_or(Ordering::Equal);
             let ord = if *dir < 0 { ord.reverse() } else { ord };
@@ -517,7 +658,6 @@ fn sort_listings(listings: &mut Vec<RoomListing>, sort: &SortOptions) {
         }
         Ordering::Equal
     });
-    *listings = indexed.into_iter().map(|(_, l)| l).collect();
 }
 
 #[cfg(test)]
@@ -682,5 +822,34 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("locked.exists".into(), "nope".into());
         assert!(RoomQuery::from_params(&p).is_err());
+    }
+
+    #[test]
+    fn parse_filter_operators() {
+        let conditions = parse_filter(&json!({
+            "slug": "abc",
+            "clients": { "lt": 2 },
+            "mode": { "in": ["a", "b"] },
+            "metadata.region": { "exists": true },
+            "rank": { "exists": false },
+        }))
+        .unwrap();
+        assert_eq!(conditions.len(), 5);
+        assert!(conditions.iter().any(|(f, c)| f == "slug" && c.op == Op::Eq));
+        assert!(conditions.iter().any(|(f, c)| f == "clients" && c.op == Op::Lt));
+        assert!(conditions.iter().any(|(f, c)| f == "mode" && matches!(c.op, Op::In(_))));
+        assert!(conditions
+            .iter()
+            .any(|(f, c)| f == "metadata.region" && c.op == Op::Exists));
+        assert!(conditions.iter().any(|(f, c)| f == "rank" && c.op == Op::NotExists));
+    }
+
+    #[test]
+    fn parse_filter_rejects_bad_shapes() {
+        assert!(parse_filter(&json!("nope")).is_err());
+        assert!(parse_filter(&json!({ "clients": { "wat": 2 } })).is_err());
+        assert!(parse_filter(&json!({ "clients": { "in": 2 } })).is_err());
+        assert!(parse_filter(&json!({ "clients": { "exists": "yes" } })).is_err());
+        assert!(parse_filter(&json!({ "clients": {} })).is_err());
     }
 }

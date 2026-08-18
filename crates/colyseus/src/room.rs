@@ -22,7 +22,7 @@ use crate::actor::RoomSender;
 use crate::client::{
     invalid_payload, AfterPatchItem, AfterPatchQueue, AfterPatchTarget, Client, ClientState,
 };
-use crate::driver::{LocalDriver, RoomListing};
+use crate::driver::{Driver, LocalDriver, RoomListing};
 use crate::error::{codes, Result, ServerError};
 use crate::matchmaker::{AuthContext, MatchmakerEvent};
 use crate::presence::Presence;
@@ -315,7 +315,7 @@ pub struct RoomContext {
     pub(crate) timers: Vec<TimerEntry>,
     next_timer_id: u64,
 
-    pub(crate) driver: Arc<LocalDriver>,
+    pub(crate) driver: Arc<dyn Driver>,
     presence: Arc<dyn Presence>,
     pub(crate) lobby_tx: broadcast::Sender<MatchmakerEvent>,
 
@@ -339,7 +339,7 @@ impl RoomContext {
         room_id: String,
         room_name: String,
         process_id: String,
-        driver: Arc<LocalDriver>,
+        driver: Arc<dyn Driver>,
         presence: Arc<dyn Presence>,
         lobby_tx: broadcast::Sender<MatchmakerEvent>,
         filter_extra: Map<String, Value>,
@@ -1174,7 +1174,7 @@ impl RoomContext {
     /// Persist listing-affecting fields to the driver and notify lobby subscribers.
     pub(crate) fn sync_listing(&self) {
         let mut updated = None;
-        self.driver.update_by_id(&self.room_id, |l| {
+        self.driver.update_by_id(&self.room_id, &mut |l| {
             l.clients = self.listing_client_count();
             l.locked = self.locked;
             l.is_private = self.is_private;

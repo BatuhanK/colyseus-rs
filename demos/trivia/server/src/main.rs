@@ -66,83 +66,64 @@ async fn main() {
         move || ChatRoom::new(chat_handle.clone())
     }).internal().persistent(false);
 
-    // build the router manually (instead of server.listen) so we can create
-    // the bootstrap room and subscribe to lobby events before serving
-    let (app, mm) = server.build();
-
-    // restore persisted rooms before accepting traffic
-    let restored = mm.restore_all().await;
-    tracing::info!("restored {} room(s) from snapshots", restored.len());
-
-    mm.create_room("chat", json!({}))
-        .await
-        .expect("failed to create the global chat room");
-
-    // announce every new trivia room in the global chat
-    tokio::spawn({
-        let mut events = mm.subscribe();
+    // bootstrap: create the global chat room and announce every new trivia
+    // room there — runs after restore, before any connection is accepted
+    let server = server.on_start(move |mm| {
         let chat_handle = chat_handle.clone();
-        let driver = mm.driver();
         async move {
-            while let Ok(event) = events.recv().await {
-                let MatchmakerEvent::RoomCreated(listing) = event else {
-                    continue;
-                };
-                if listing.name != "trivia" {
-                    continue;
-                }
-                let Some(sender) = chat_handle.get() else {
-                    continue;
-                };
-                let category = listing
-                    .extra
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("genel")
-                    .to_string();
-                let difficulty = listing
-                    .extra
-                    .get("difficulty")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("easy")
-                    .to_string();
-                let room_id = listing.room_id.clone();
-                let driver = driver.clone();
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    // skip ghost rooms from double-submits / instant disconnects
-                    // (they get created and auto-disposed within milliseconds)
-                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                    if driver.get(&room_id).is_none() {
-                        return;
+            mm.create_room("chat", json!({})).await?;
+
+            let mut events = mm.subscribe();
+            let driver = mm.driver();
+            tokio::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    let MatchmakerEvent::RoomCreated(listing) = event else {
+                        continue;
+                    };
+                    if listing.name != "trivia" {
+                        continue;
                     }
-                    sender.send(move |room: &mut ChatRoom, ctx| {
-                        let room_id = room_id.clone();
-                        Box::pin(async move {
-                            room.system_message(
-                                ctx,
-                                format!("🎮 new game: {category} ({difficulty})"),
-                                Some(room_id),
-                            );
-                        })
+                    let Some(sender) = chat_handle.get() else {
+                        continue;
+                    };
+                    let category = listing
+                        .extra
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("genel")
+                        .to_string();
+                    let difficulty = listing
+                        .extra
+                        .get("difficulty")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("easy")
+                        .to_string();
+                    let room_id = listing.room_id.clone();
+                    let driver = driver.clone();
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        // skip ghost rooms from instant disconnects
+                        // (they get created and auto-disposed within milliseconds)
+                        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                        if driver.get(&room_id).is_none() {
+                            return;
+                        }
+                        sender.send(move |room: &mut ChatRoom, ctx| {
+                            let room_id = room_id.clone();
+                            Box::pin(async move {
+                                room.system_message(
+                                    ctx,
+                                    format!("🎮 new game: {category} ({difficulty})"),
+                                    Some(room_id),
+                                );
+                            })
+                        });
                     });
-                });
-            }
+                }
+            });
+            Ok(())
         }
     });
 
-    let addr = "0.0.0.0:2568";
-    println!("⚔️  colyseus-rs — listening on ws://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down: disposing all rooms...");
-            mm.shutdown().await;
-        })
-        .await
-        .expect("server error");
+    server.listen("0.0.0.0:2568").await.expect("server error");
 }

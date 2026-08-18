@@ -89,11 +89,11 @@ impl AdminRpc for CreateGame {
     type Response = CreateGameResult;
 
     async fn call(params: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
-        let listing = ctx
+        let outcome = ctx
             .create_room("game", json!({ "mode": params.mode }))
             .await?;
         Ok(CreateGameResult {
-            room_id: listing.room_id,
+            room_id: outcome.listing.room_id,
         })
     }
 }

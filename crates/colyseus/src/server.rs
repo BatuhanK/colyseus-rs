@@ -14,6 +14,7 @@
 //!   frames as described in [`crate::protocol`].
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -29,18 +30,22 @@ use tower_http::cors::CorsLayer;
 
 use crate::actor::{RoomEvent, RoomHandle};
 use crate::client::{Client, Outbound};
-use crate::driver::RoomQuery;
+use crate::driver::{Driver, RoomQuery};
 use crate::error::{close_codes, codes, Result, ServerError};
 use crate::matchmaker::{AuthContext, MatchMaker, RegisteredHandler};
 use crate::presence::Presence;
 use crate::protocol::{self, ClientMessage};
-use crate::room::Room;
+use crate::room::{BoxFuture, Room};
 use crate::snapshot::PersistenceConfig;
+
+/// A bootstrap closure run by [`Server::listen`] before accepting traffic.
+type OnStartFn = Box<dyn FnOnce(MatchMaker) -> BoxFuture<'static, Result<()>> + Send>;
 
 /// The game server. Register room types, then [`Server::listen`].
 pub struct Server {
     handlers: HashMap<String, RegisteredHandler>,
     presence: Option<Arc<dyn Presence>>,
+    driver: Option<Arc<dyn Driver>>,
     public_address: Option<String>,
     extra_router: Option<Router>,
     cors: bool,
@@ -52,11 +57,13 @@ pub struct Server {
     /// Bearer token guarding the `/admin/api/*` endpoints (panel + SDK RPCs).
     admin_token: Option<String>,
     /// Custom admin RPCs registered via [`Server::admin_rpc`].
-    admin_rpcs: Vec<(String, crate::admin_rpc::RpcFn)>,
+    admin_rpcs: Vec<crate::admin_rpc::AdminRpcRegistration>,
     /// Custom room RPCs registered via [`Server::room_rpc`].
     room_rpcs: Vec<(String, crate::admin_rpc::RoomRpcHandler)>,
     /// Snapshot persistence configuration.
     persistence: Option<PersistenceConfig>,
+    /// Bootstrap closure run by [`Server::listen`] before accepting traffic.
+    on_start: Option<OnStartFn>,
 }
 
 impl Default for Server {
@@ -70,6 +77,7 @@ impl Server {
         Server {
             handlers: HashMap::new(),
             presence: None,
+            driver: None,
             public_address: None,
             extra_router: None,
             cors: true,
@@ -81,12 +89,20 @@ impl Server {
             admin_rpcs: Vec::new(),
             room_rpcs: Vec::new(),
             persistence: None,
+            on_start: None,
         }
     }
 
     /// Override the default in-process presence.
     pub fn presence(mut self, presence: Arc<dyn Presence>) -> Self {
         self.presence = Some(presence);
+        self
+    }
+
+    /// Override the default in-memory room-listing driver (the scale-out
+    /// seam — see [`Driver`]).
+    pub fn driver(mut self, driver: Arc<dyn Driver>) -> Self {
+        self.driver = Some(driver);
         self
     }
 
@@ -167,7 +183,12 @@ impl Server {
     /// ```
     pub fn admin_rpc<T: crate::admin_rpc::AdminRpc>(mut self, name: &str) -> Self {
         self.admin_rpcs
-            .push((name.to_string(), crate::admin_rpc::rpc_fn::<T>()));
+            .push(crate::admin_rpc::AdminRpcRegistration {
+                name: name.to_string(),
+                handler: crate::admin_rpc::rpc_fn::<T>(),
+                params_type: std::any::type_name::<T::Params>(),
+                response_type: std::any::type_name::<T::Response>(),
+            });
         self
     }
 
@@ -247,6 +268,29 @@ impl Server {
         self
     }
 
+    /// Register a bootstrap closure run by [`Server::listen`] — after the
+    /// matchmaker is built and persisted rooms are restored, but before any
+    /// connection is accepted. The [`MatchMaker`] handle exposes
+    /// `create_room` / `restore_all` / `presence` / `subscribe`.
+    ///
+    /// ```ignore
+    /// let server = Server::new().on_start(|mm| async move {
+    ///     mm.create_room("chat", json!({})).await?;
+    ///     Ok(())
+    /// });
+    /// ```
+    ///
+    /// Only `listen` runs it — when embedding via [`Server::build`], run your
+    /// bootstrap against the returned matchmaker yourself.
+    pub fn on_start<F, Fut>(mut self, f: F) -> Self
+    where
+        F: FnOnce(MatchMaker) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.on_start = Some(Box::new(move |mm| Box::pin(f(mm))));
+        self
+    }
+
     /// Define a room type. Returns the handler for further configuration
     /// (`filter_by`, `sort_by`, `default_options`).
     ///
@@ -270,7 +314,7 @@ impl Server {
     /// Build the axum router and the matchmaker handle. Useful for embedding
     /// into an existing axum app or for tests.
     pub fn build(self) -> (Router, MatchMaker) {
-        let mm = MatchMaker::new(self.presence, self.public_address, self.persistence);
+        let mm = MatchMaker::new(self.presence, self.driver, self.public_address, self.persistence);
         for (_, handler) in self.handlers {
             mm.register(handler);
         }
@@ -311,13 +355,19 @@ impl Server {
     }
 
     /// Bind, serve, and handle graceful shutdown (Ctrl-C / SIGTERM).
-    pub async fn listen(self, addr: &str) -> Result<()> {
+    pub async fn listen(mut self, addr: &str) -> Result<()> {
         self.greet_banner(addr);
+        let on_start = self.on_start.take();
         let (app, mm) = self.build();
 
         // Restore persisted rooms before accepting any traffic.
         let restored = mm.restore_all().await;
         tracing::info!("restored {} room(s) from snapshots", restored.len());
+
+        // Bootstrap hook (create bootstrap rooms, subscribe to lobby events…).
+        if let Some(on_start) = on_start {
+            on_start(mm.clone()).await?;
+        }
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -380,7 +430,7 @@ async fn matchmake_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
-    let options = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let (options, filter) = split_matchmake_body(body.map(|Json(v)| v).unwrap_or(Value::Null));
     let auth = AuthContext {
         token: bearer_token(&headers),
         headers: headers
@@ -390,6 +440,9 @@ async fn matchmake_handler(
         ip: header(&headers, "x-forwarded-for")
             .or_else(|| header(&headers, "x-real-ip")),
     };
+    let idempotency_key = header(&headers, "idempotency-key")
+        .filter(|k| !k.is_empty())
+        .map(|k| format!("{method}:{room_name}:{k}"));
 
     // internal room types can't be created through the public API
     if matches!(method.as_str(), "joinOrCreate" | "create") {
@@ -403,10 +456,33 @@ async fn matchmake_handler(
         }
     }
 
+    // an optional operator-style filter applies to joinOrCreate / join
+    let filter = match filter {
+        Some(f) if matches!(method.as_str(), "joinOrCreate" | "join") => {
+            match mm.parse_match_filter(&room_name, &f) {
+                Ok(conditions) => Some(conditions),
+                Err(e) => return error_response(e),
+            }
+        }
+        // `create` always makes a new room; `joinById` targets a specific one
+        _ => None,
+    };
+
+    // replay the cached reservation for a duplicate Idempotency-Key
+    if let Some(key) = &idempotency_key {
+        if let Some(reservation) = mm.idempotency_get(key) {
+            return Json(reservation).into_response();
+        }
+    }
+
     let result = match method.as_str() {
-        "joinOrCreate" => mm.join_or_create(&room_name, options, auth).await,
+        "joinOrCreate" => {
+            mm.join_or_create_with_filter(&room_name, options, filter.as_deref().unwrap_or(&[]), auth).await
+        }
         "create" => mm.create(&room_name, options, auth).await,
-        "join" => mm.join(&room_name, options, auth).await,
+        "join" => {
+            mm.join_with_filter(&room_name, options, filter.as_deref().unwrap_or(&[]), auth).await
+        }
         "joinById" => mm.join_by_id(&room_name, options, auth).await,
         "reconnect" => {
             let token = options
@@ -430,8 +506,28 @@ async fn matchmake_handler(
     };
 
     match result {
-        Ok(reservation) => Json(reservation).into_response(),
+        Ok(reservation) => {
+            if let Some(key) = idempotency_key {
+                mm.idempotency_put(key, reservation.clone());
+            }
+            Json(reservation).into_response()
+        }
         Err(e) => error_response(e),
+    }
+}
+
+/// Split a matchmake body into `(options, filter)`. The extended form
+/// `{ "options": {…}, "filter": {…} }` is detected by the reserved keys
+/// `options` / `filter`; any other body is treated as bare client options
+/// (backwards compatible).
+fn split_matchmake_body(body: Value) -> (Value, Option<Value>) {
+    match &body {
+        Value::Object(map) if map.contains_key("options") || map.contains_key("filter") => {
+            let options = map.get("options").cloned().unwrap_or(Value::Null);
+            let filter = map.get("filter").cloned();
+            (options, filter)
+        }
+        _ => (body, None),
     }
 }
 

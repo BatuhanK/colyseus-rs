@@ -3,14 +3,12 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
+import { Client, type RoomListing } from "colyseus-rs-client";
+
 import { env } from "~/env";
 import { api } from "~/trpc/react";
 
-interface RoomListing {
-  roomId: string;
-  clients: number;
-  maxClients?: number;
-  createdAt: number;
+interface TriviaRoomListing extends RoomListing {
   difficulty?: string;
   category?: string;
   metadata?: { phase?: string; round?: number; players?: number; spectators?: number; hasPassword?: boolean };
@@ -34,7 +32,7 @@ const PHASE_LABEL: Record<string, string> = {
 
 export function Lobby() {
   const router = useRouter();
-  const [rooms, setRooms] = useState<RoomListing[] | null>(null);
+  const [rooms, setRooms] = useState<TriviaRoomListing[] | null>(null);
   const [serverDown, setServerDown] = useState(false);
 
   const [search, setSearch] = useState("");
@@ -48,33 +46,40 @@ export function Lobby() {
     refetchInterval: 5000,
   });
 
+  const client = useMemo(() => new Client(env.NEXT_PUBLIC_GAME_URL), []);
+
+  // Server-side query: difficulty filter + newest-first sort run on the game
+  // server; only the substring category search stays client-side (the query
+  // language has no contains-op).
   useEffect(() => {
+    let dead = false;
     const refresh = async () => {
       try {
-        const res = await fetch(`${env.NEXT_PUBLIC_GAME_URL}/rooms/trivia`, {
-          cache: "no-store",
+        const page = await client.rooms((q) => {
+          q.name("trivia").sort("createdAt", "desc").limit(50);
+          if (difficultyFilter !== "all") q.whereEq("difficulty", difficultyFilter);
         });
-        setRooms((await res.json()) as RoomListing[]);
+        if (dead) return;
+        setRooms(page.items);
         setServerDown(false);
       } catch {
-        setServerDown(true);
+        if (!dead) setServerDown(true);
       }
     };
     void refresh();
     const t = setInterval(refresh, 2500);
-    return () => clearInterval(t);
-  }, []);
+    return () => {
+      dead = true;
+      clearInterval(t);
+    };
+  }, [client, difficultyFilter]);
 
   const filtered = useMemo(() => {
-    return (rooms ?? [])
-      .filter((r) => difficultyFilter === "all" || r.difficulty === difficultyFilter)
-      .filter((r) =>
-        search.trim() === ""
-          ? true
-          : (r.category ?? "").toLowerCase().includes(search.trim().toLowerCase()),
-      )
-      .sort((a, b) => b.createdAt - a.createdAt);
-  }, [rooms, search, difficultyFilter]);
+    const q = search.trim().toLowerCase();
+    return (rooms ?? []).filter(
+      (r) => q === "" || (r.category ?? "").toLowerCase().includes(q),
+    );
+  }, [rooms, search]);
 
   const createRoom = (e: React.FormEvent) => {
     e.preventDefault();

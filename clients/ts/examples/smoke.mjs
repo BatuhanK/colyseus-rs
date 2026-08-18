@@ -1,4 +1,4 @@
-import { Client } from "./src/client.ts";
+import { Client } from "../src/client.ts";
 
 const client = new Client("http://localhost:2567");
 const room = await client.joinOrCreate("game", { mode: "ranked" });

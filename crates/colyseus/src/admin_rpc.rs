@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use crate::actor::{RoomEvent, RoomHandle, RoomInspection};
 use crate::driver::{RoomListing, RoomQuery, RoomQueryResult};
 use crate::error::{close_codes, codes, Result, ServerError};
-use crate::matchmaker::{MatchMaker, MatchmakerEvent};
+use crate::matchmaker::{CreateRoomOutcome, MatchMaker, MatchmakerEvent};
 use crate::presence::Presence;
 use crate::protocol::MessageType;
 use crate::room::{BoxFuture, Room, RoomContext};
@@ -28,6 +28,16 @@ const ROOM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// A registered RPC handler: `(ctx, params JSON) -> response JSON`.
 pub(crate) type RpcFn =
     Arc<dyn Fn(AdminContext, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
+
+/// A custom admin RPC registration: the erased handler plus the Rust
+/// param/response type names, surfaced by `GET /admin/api/schema`.
+#[derive(Clone)]
+pub(crate) struct AdminRpcRegistration {
+    pub name: String,
+    pub handler: RpcFn,
+    pub params_type: &'static str,
+    pub response_type: &'static str,
+}
 
 /// A clonable handle giving admin RPCs safe access to the matchmaker and its
 /// rooms. Operations run outside any room actor (they talk to rooms through
@@ -69,8 +79,10 @@ impl AdminContext {
         self.mm.driver().get(room_id)
     }
 
-    /// Create a room server-side (no seat is reserved).
-    pub async fn create_room(&self, room_name: &str, options: Value) -> Result<RoomListing> {
+    /// Create a room server-side (no seat is reserved). When the room type
+    /// declares `unique_by` and a live room with the same key exists, it is
+    /// returned with `created: false`.
+    pub async fn create_room(&self, room_name: &str, options: Value) -> Result<CreateRoomOutcome> {
         self.mm.create_room(room_name, options).await
     }
 
@@ -283,6 +295,12 @@ impl AdminContext {
 /// ```
 ///
 /// For a params-less RPC use `type Params = ()` (the HTTP body may be empty).
+///
+/// Callers may send an `Idempotency-Key` header: a successful response is
+/// then cached for ~30s and replayed for duplicate keys (errors are never
+/// cached). Handlers must therefore be side-effect-safe under replay within
+/// that window — a retried call returns the original response without
+/// re-running the handler.
 #[async_trait]
 pub trait AdminRpc: Send + 'static {
     type Params: DeserializeOwned + Send;

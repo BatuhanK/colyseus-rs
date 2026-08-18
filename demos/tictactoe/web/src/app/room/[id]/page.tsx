@@ -4,7 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { env } from "~/env";
-import { Client, type Room } from "~/lib/colyseus";
+import { Client, type Room } from "colyseus-rs-client";
 import { api } from "~/trpc/react";
 
 interface PlayerInfo {

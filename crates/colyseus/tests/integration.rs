@@ -869,9 +869,9 @@ impl AdminRpc for CreateStateRpc {
     type Params = CreateStateRpc;
     type Response = CreateStateRpcResult;
     async fn call(p: Self::Params, ctx: AdminContext) -> Result<Self::Response> {
-        let listing = ctx.create_room("state", json!({ "mode": p.mode })).await?;
+        let outcome = ctx.create_room("state", json!({ "mode": p.mode })).await?;
         Ok(CreateStateRpcResult {
-            room_id: listing.room_id,
+            room_id: outcome.listing.room_id,
         })
     }
 }
@@ -900,6 +900,26 @@ impl AdminRpc for ResetCountRpc {
             })
         });
         Ok(ResetCountRpcResult { found })
+    }
+}
+
+/// Counts invocations, to prove idempotent replays don't re-run the handler.
+static BUMP_CALLS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+struct BumpRpc;
+
+#[derive(Serialize)]
+struct BumpRpcResult {
+    calls: i64,
+}
+
+#[async_trait]
+impl AdminRpc for BumpRpc {
+    type Params = ();
+    type Response = BumpRpcResult;
+    async fn call(_p: Self::Params, _ctx: AdminContext) -> Result<Self::Response> {
+        let calls = BUMP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(BumpRpcResult { calls })
     }
 }
 
@@ -932,12 +952,17 @@ impl RoomRpc<StateRoom> for AdjustCountRpc {
 
 async fn start_admin_rpc_server() -> (String, tokio::task::JoinHandle<()>) {
     let mut server = Server::new();
-    server.define("state", || StateRoom);
+    server
+        .define("state", || StateRoom)
+        .filter_by(&["mode"])
+        .sort_by(&[("clients", 1)]);
+    server.define("match", || StateRoom).unique_by(&["slug"]);
     let server = server
         .admin_token(Some("backend-secret".to_string()))
         .admin_rpc::<SumRpc>("sum")
         .admin_rpc::<CreateStateRpc>("createState")
         .admin_rpc::<ResetCountRpc>("resetCount")
+        .admin_rpc::<BumpRpc>("bump")
         .room_rpc::<StateRoom, AdjustCountRpc>("adjustCount");
     let (app, _mm) = server.build();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -946,6 +971,93 @@ async fn start_admin_rpc_server() -> (String, tokio::task::JoinHandle<()>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn matchmake_filter_operators() {
+    let server = start_server().await;
+
+    // r1 creates the first room (chat has maxClients=2; a reserved seat
+    // counts towards `clients`)
+    let r1 = matchmake(&server.base, "joinOrCreate", "chat", json!({})).await;
+    let room_a = r1["room"]["roomId"].as_str().unwrap().to_string();
+
+    // filter `clients < 1` excludes the waiting room → a new one is created
+    let r2 = matchmake(
+        &server.base,
+        "joinOrCreate",
+        "chat",
+        json!({ "options": {}, "filter": { "clients": { "lt": 1 } } }),
+    )
+    .await;
+    let room_b = r2["room"]["roomId"].as_str().unwrap().to_string();
+    assert_ne!(room_a, room_b);
+
+    // filter `clients < 2` matches a waiting room → joins instead of creating
+    let r3 = matchmake(
+        &server.base,
+        "joinOrCreate",
+        "chat",
+        json!({ "options": {}, "filter": { "clients": { "lt": 2 } } }),
+    )
+    .await;
+    assert!(r3["sessionId"].is_string(), "unexpected: {r3}");
+    let rooms: Value = reqwest::Client::new()
+        .get(format!("{}/rooms/chat", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rooms["total"], 2, "no third room should have been created");
+
+    // the extended body form still passes `options` through to the room type
+    let r4 = matchmake(
+        &server.base,
+        "joinOrCreate",
+        "chat",
+        json!({ "options": { "mode": "ranked" }, "filter": { "clients": { "lt": 2 } } }),
+    )
+    .await;
+    assert_eq!(r4["room"]["mode"], "ranked", "options must reach filter_by fields: {r4}");
+
+    // unknown filter fields are rejected by the whitelist
+    let resp = reqwest::Client::new()
+        .post(format!("{}/matchmake/joinOrCreate/chat", server.base))
+        .json(&json!({ "options": {}, "filter": { "nope": 1 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 521);
+}
+
+#[tokio::test]
+async fn idempotency_key_replays_seat_reservation() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/matchmake/joinOrCreate/state", server.base);
+
+    let post = |key: Option<&str>| {
+        let req = client.post(&url).json(&json!({}));
+        match key {
+            Some(key) => req.header("idempotency-key", key),
+            None => req,
+        }
+    };
+
+    let r1: Value = post(Some("key-1")).send().await.unwrap().json().await.unwrap();
+    let r2: Value = post(Some("key-1")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r1["sessionId"], r2["sessionId"], "same key replays the reservation");
+    assert_eq!(r1["room"]["roomId"], r2["room"]["roomId"]);
+
+    // a different key (or none) reserves a fresh seat
+    let r3: Value = post(Some("key-2")).send().await.unwrap().json().await.unwrap();
+    assert!(r3["sessionId"].is_string(), "unexpected: {r3}");
+    assert_ne!(r3["sessionId"], r1["sessionId"]);
+    let r4: Value = post(None).send().await.unwrap().json().await.unwrap();
+    assert!(r4["sessionId"].is_string(), "unexpected: {r4}");
+    assert_ne!(r4["sessionId"], r1["sessionId"]);
 }
 
 #[tokio::test]
@@ -1126,6 +1238,143 @@ async fn room_rpc_runs_on_room_actor() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn admin_schema_lists_room_types_and_rpcs() {
+    let (base, handle) = start_admin_rpc_server().await;
+
+    // no token → 401 (same guard as the other admin endpoints)
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/admin/api/schema"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    let schema: Value = reqwest::Client::new()
+        .get(format!("{base}/admin/api/schema"))
+        .bearer_auth("backend-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // room types with their registration knobs
+    let room_types = schema["roomTypes"].as_array().unwrap();
+    let state = room_types.iter().find(|t| t["name"] == "state").unwrap();
+    assert_eq!(state["filterBy"], json!(["mode"]));
+    assert_eq!(state["sortBy"], json!([["clients", 1]]));
+    assert_eq!(state["uniqueBy"], json!([]));
+    assert_eq!(state["strictFilterFields"], false);
+    assert_eq!(state["internal"], false);
+    assert_eq!(state["persistent"], true);
+    let matched = room_types.iter().find(|t| t["name"] == "match").unwrap();
+    assert_eq!(matched["uniqueBy"], json!(["slug"]));
+
+    // admin RPCs, sorted by name, with their Rust type names
+    let rpcs = schema["adminRpcs"].as_array().unwrap();
+    let names: Vec<&str> = rpcs.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["bump", "createState", "resetCount", "sum"]);
+    let sum = rpcs.iter().find(|r| r["name"] == "sum").unwrap();
+    assert!(sum["params"].as_str().unwrap().ends_with("SumRpc"));
+    assert!(sum["response"].as_str().unwrap().ends_with("SumRpcResult"));
+
+    // core filterable listing fields
+    assert_eq!(
+        schema["coreFilterFields"],
+        json!(["name", "clients", "maxClients", "locked", "private", "createdAt", "processId"])
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn admin_rpc_idempotency_key_replays_response() {
+    let (base, handle) = start_admin_rpc_server().await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/admin/api/rpc/bump");
+
+    let post = |key: Option<&str>| {
+        let req = client.post(&url).bearer_auth("backend-secret");
+        match key {
+            Some(key) => req.header("idempotency-key", key),
+            None => req,
+        }
+    };
+
+    let r1: Value = post(Some("rpc-key-1")).send().await.unwrap().json().await.unwrap();
+    let calls = r1["calls"].as_i64().unwrap();
+    let r2: Value = post(Some("rpc-key-1")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r2["calls"], calls, "duplicate key replays the cached response");
+
+    // a different key (or none) runs the handler again
+    let r3: Value = post(Some("rpc-key-2")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r3["calls"], calls + 1);
+    let r4: Value = post(None).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r4["calls"], calls + 2);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn admin_room_events_ws_auth_via_subprotocol() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (base, handle) = start_admin_rpc_server().await;
+
+    // create a room to stream events from
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/admin/api/rpc/createState"))
+        .bearer_auth("backend-secret")
+        .json(&json!({ "mode": "ranked" }))
+        .send()
+        .await
+        .unwrap();
+    let room_id = resp.json::<Value>().await.unwrap()["roomId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ws_url = format!(
+        "{}/admin/api/rooms/{room_id}/events",
+        base.replace("http://", "ws://")
+    );
+
+    // no token at all → handshake rejected
+    assert!(
+        tokio_tungstenite::connect_async(&ws_url).await.is_err(),
+        "unauthenticated ws should be rejected"
+    );
+
+    // token via subprotocol → accepted, and echoed back per RFC 6455
+    let mut req = ws_url.clone().into_client_request().unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        "bearer.backend-secret".parse().unwrap(),
+    );
+    let (ws, response) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(
+        response.headers().get("sec-websocket-protocol").unwrap(),
+        "bearer.backend-secret"
+    );
+    drop(ws);
+
+    // wrong token via subprotocol → rejected
+    let mut req = ws_url.clone().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "bearer.wrong".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(req).await.is_err());
+
+    // deprecated query-param fallback still works
+    let (ws, _) = tokio_tungstenite::connect_async(format!("{ws_url}?token=backend-secret"))
+        .await
+        .unwrap();
+    drop(ws);
 
     handle.abort();
 }

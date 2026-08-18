@@ -23,6 +23,24 @@
 
 import { encode, decode } from "@msgpack/msgpack";
 
+import {
+  RoomQueryBuilder,
+  type RoomFilter,
+  type RoomListing,
+  type RoomQueryResult,
+} from "./query.ts";
+import { combineAbortSignals, randomIdempotencyKey, type CallOptions } from "./util.ts";
+
+export {
+  RoomQueryBuilder,
+  type RoomFilter,
+  type RoomFilterValue,
+  type RoomListing,
+  type RoomQueryOp,
+  type RoomQueryResult,
+} from "./query.ts";
+export { type CallOptions } from "./util.ts";
+
 // protocol codes (must match the server)
 const JOIN_ROOM = 10;
 const ERROR = 11;
@@ -32,19 +50,6 @@ const ROOM_STATE = 14;
 const ROOM_STATE_PATCH = 15;
 const ROOM_DATA_BYTES = 17;
 const PING = 18;
-
-export interface RoomListing {
-  roomId: string;
-  name: string;
-  processId: string;
-  clients: number;
-  maxClients?: number;
-  locked: boolean;
-  private: boolean;
-  metadata?: any;
-  createdAt: number;
-  [key: string]: any; // filter_by fields
-}
 
 export interface SeatReservation {
   room: RoomListing;
@@ -190,6 +195,17 @@ export class Room {
   }
 }
 
+/** Per-call options for the matchmaking methods (`joinOrCreate` & friends). */
+export interface MatchmakeOptions extends CallOptions {
+  /**
+   * Server-side room filter, applied by `joinOrCreate` / `join`:
+   * `{ clients: { lt: 2 }, slug: "abc", mode: { in: ["a", "b"] } }`.
+   * Accepted by `create` for symmetry but ignored (create always makes a
+   * new room; `joinById` targets a specific one) — matching server behavior.
+   */
+  filter?: RoomFilter;
+}
+
 export class Client {
   private baseUrl: string;
   private getHeaders?: () => Record<string, string>;
@@ -204,31 +220,78 @@ export class Client {
     this.getHeaders = getHeaders;
   }
 
-  joinOrCreate(roomName: string, options: any = {}) {
-    return this.matchmake("joinOrCreate", roomName, options);
+  joinOrCreate(roomName: string, options: any = {}, call: MatchmakeOptions = {}) {
+    return this.matchmake("joinOrCreate", roomName, options, call);
   }
-  create(roomName: string, options: any = {}) {
-    return this.matchmake("create", roomName, options);
+  create(roomName: string, options: any = {}, call: MatchmakeOptions = {}) {
+    return this.matchmake("create", roomName, options, call);
   }
-  join(roomName: string, options: any = {}) {
-    return this.matchmake("join", roomName, options);
+  join(roomName: string, options: any = {}, call: MatchmakeOptions = {}) {
+    return this.matchmake("join", roomName, options, call);
   }
-  joinById(roomId: string, options: any = {}) {
-    return this.matchmake("joinById", roomId, options);
+  joinById(roomId: string, options: any = {}, call: CallOptions = {}) {
+    return this.matchmake("joinById", roomId, options, call);
   }
 
-  /** List public rooms (optionally filtered by room name). */
-  async rooms(roomName?: string): Promise<RoomListing[]> {
-    const res = await fetch(`${this.baseUrl}/rooms${roomName ? `/${roomName}` : ""}`);
+  /**
+   * Query public room listings (GET /rooms), returning a page of results.
+   *
+   * ```ts
+   * const page = await client.rooms((q) =>
+   *   q.name("trivia").where("clients", "lt", 2).sort("createdAt", "desc").limit(20),
+   * );
+   * ```
+   *
+   * Passing a plain room name (`client.rooms("trivia")`) lists that type with
+   * the server's default paging.
+   */
+  async rooms(
+    query?: string | ((q: RoomQueryBuilder) => void | RoomQueryBuilder),
+  ): Promise<RoomQueryResult> {
+    let url: string;
+    if (typeof query === "function") {
+      const q = new RoomQueryBuilder();
+      query(q);
+      const qs = q.toString();
+      url = `${this.baseUrl}/rooms${qs ? `?${qs}` : ""}`;
+    } else {
+      url = `${this.baseUrl}/rooms${query ? `/${query}` : ""}`;
+    }
+    const res = await fetch(url);
     return res.json();
   }
 
-  private async matchmake(method: string, roomName: string, options: any): Promise<Room> {
-    const res = await fetch(`${this.baseUrl}/matchmake/${method}/${roomName}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...this.getHeaders?.() },
-      body: JSON.stringify(options ?? {}),
-    });
+  private async matchmake(
+    method: string,
+    roomName: string,
+    options: any,
+    call: MatchmakeOptions,
+  ): Promise<Room> {
+    // the server only applies `filter` to joinOrCreate / join
+    const body =
+      call.filter && (method === "joinOrCreate" || method === "join")
+        ? { options: options ?? {}, filter: call.filter }
+        : (options ?? {});
+
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      ...this.getHeaders?.(),
+    };
+    // replay protection: the server caches the seat reservation per key (30s)
+    headers["idempotency-key"] = call.idempotencyKey ?? randomIdempotencyKey();
+
+    const { signal, cancel } = combineAbortSignals(call.timeout, call.signal);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/matchmake/${method}/${roomName}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      });
+    } finally {
+      cancel();
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({ code: res.status, error: res.statusText }));
       throw new MatchmakeError(body.code, body.error);
@@ -240,9 +303,9 @@ export class Client {
   }
 
   /** Reconnect into a room after a drop (server must have called allow_reconnection). */
-  async reconnect(room: Room): Promise<Room> {
+  async reconnect(room: Room, call: CallOptions = {}): Promise<Room> {
     if (!room.reconnectionToken) throw new Error("no reconnection token");
-    return this.reconnectById(room.reservation.room.roomId, room.reconnectionToken);
+    return this.reconnectById(room.reservation.room.roomId, room.reconnectionToken, call);
   }
 
   /**
@@ -250,12 +313,21 @@ export class Client {
    * previous Room object no longer exists (persist the token in
    * sessionStorage if you want F5-proof sessions).
    */
-  async reconnectById(roomId: string, reconnectionToken: string): Promise<Room> {
-    const res = await fetch(`${this.baseUrl}/matchmake/reconnect/${roomId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...this.getHeaders?.() },
-      body: JSON.stringify({ reconnectionToken }),
-    });
+  async reconnectById(roomId: string, reconnectionToken: string, call: CallOptions = {}): Promise<Room> {
+    // no idempotency key: reconnect consumes a pending reconnection slot and
+    // must not replay an earlier reservation
+    const { signal, cancel } = combineAbortSignals(call.timeout, call.signal);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/matchmake/reconnect/${roomId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...this.getHeaders?.() },
+        body: JSON.stringify({ reconnectionToken }),
+        signal,
+      });
+    } finally {
+      cancel();
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({ code: res.status, error: res.statusText }));
       throw new MatchmakeError(body.code, body.error);

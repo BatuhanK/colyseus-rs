@@ -54,12 +54,13 @@ pub use admin_rpc::{AdminContext, AdminRpc, RoomRpc};
 pub use client::{Client, ClientState, SendOptions};
 pub use command::{Command, Dispatchable, Dispatcher};
 pub use driver::{
-    Condition, Conditions, LocalDriver, Op, RoomListing, RoomQuery, RoomQueryBuilder,
+    Condition, Conditions, Driver, LocalDriver, Op, RoomListing, RoomQuery, RoomQueryBuilder,
     RoomQueryResult, SortOptions,
 };
 pub use error::{close_codes, codes, Result, ServerError};
 pub use matchmaker::{
-    AuthContext, MatchMaker, MatchmakerEvent, RegisteredHandler, RoomStats, SeatReservation,
+    AuthContext, CreateRoomOutcome, MatchMaker, MatchmakerEvent, RegisteredHandler, RoomStats,
+    SeatReservation,
 };
 pub use presence::{LocalPresence, Presence};
 pub use protocol::MessageType;

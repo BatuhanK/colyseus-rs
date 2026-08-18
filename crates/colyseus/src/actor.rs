@@ -665,7 +665,11 @@ impl RoomActor {
         // ---------------------------------------------------------------
         // Normal join path
         // ---------------------------------------------------------------
-        let Some(seat) = self.ctx.reserved_seats.get(&session_id) else {
+        // Mark the seat consumed up front (keeping a tombstone in the map) so
+        // a duplicate connection with the same session id — e.g. a second
+        // WebSocket arriving while `on_join` is still running — is rejected
+        // by the `consumed` branch instead of double-joining.
+        let Some(seat) = self.ctx.reserved_seats.get_mut(&session_id) else {
             let _ = respond.send(Err(ServerError::seat_expired()));
             return;
         };
@@ -676,16 +680,20 @@ impl RoomActor {
             )));
             return;
         }
-        let seat = self.ctx.reserved_seats.remove(&session_id).unwrap();
+        seat.consumed = true;
+        let (options, auth) = (seat.options.clone(), seat.auth.clone());
 
-        client.set_auth(seat.auth.clone());
+        client.set_auth(auth.clone());
         client.set_state(ClientState::Joining);
         self.ctx.clients.push(client.clone());
 
         let join_result = self
             .room
-            .on_join(&mut self.ctx, client.clone(), seat.options, seat.auth)
+            .on_join(&mut self.ctx, client.clone(), options, auth)
             .await;
+
+        // join decided — drop the consumed tombstone either way
+        self.ctx.reserved_seats.remove(&session_id);
 
         // user may have closed the client inside on_join
         let early_leave = client.state() == ClientState::Leaving;
